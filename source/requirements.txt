@@ -1,0 +1,12 @@
+torch
+einops==0.7.0
+diffusers==0.26.3
+transformers==4.37.2
+k_diffusion==0.1.1.post1
+safetensors==0.4.2
+gradio==3.44.4
+timm==0.9.12
+basicsr==1.4.2
+controlnet-aux==0.0.7
+mediapipe==0.10.9
+kaleido==0.2.1
