@@ -144,46 +144,16 @@ def encode_region_map(state,tokenizer,unet,width,height, scale_ratio=8, text_ids
             return torch.FloatTensor(0)
         uncond, cond = text_ids[0], text_ids[1]
 
-        '''img_state = []
-        
-
-        for k, v in state.items():
-            if v["map"] is None:
-                continue
-
-            v_input = tokenizer(
-                k,
-                max_length=tokenizer.model_max_length,
-                truncation=True,
-                add_special_tokens=False,
-            ).input_ids
-
-            dotmap = v["map"] < 255
-            out = dotmap.astype(float)
-            out = out * float(v["weight"]) * g_strength
-            #if v["mask_outsides"]:
-            out[out==0] = -1 * float(v["mask_outsides"])
-
-            arr = torch.from_numpy(
-                out
-            )
-            img_state.append((v_input, arr))
-
-        if len(img_state) == 0:
-            return torch.FloatTensor(0)'''
-
         w_tensors = dict()
         cond = cond.tolist()
         uncond = uncond.tolist()
         for layer in unet.down_blocks:
             c = int(len(cond))
-            #w, h = img_state[0][1].shape
             w_r, h_r = int(math.ceil(width / scale_ratio)), int(math.ceil(height / scale_ratio))
 
             ret_cond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
             ret_uncond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
 
-            #for v_as_tokens, img_where_color in img_state:
             for k, v in state.items():
                 if v["map"] is None:
                     continue
@@ -206,18 +176,6 @@ def encode_region_map(state,tokenizer,unet,width,height, scale_ratio=8, text_ids
                 )
                 ret = ret.reshape(-1, 1).repeat(1, len(k_as_tokens))
 
-                '''ret = (
-                    F.interpolate(
-                        img_where_color.unsqueeze(0).unsqueeze(1),
-                        scale_factor=1 / scale_ratio,
-                        mode="bilinear",
-                        align_corners=True,
-                    )
-                    .squeeze()
-                    .reshape(-1, 1)
-                    .repeat(1, len(v_as_tokens))
-                )'''
-
                 for idx, tok in enumerate(cond):
                     if cond[idx : idx + len(k_as_tokens)] == k_as_tokens:
                         is_in = 1
@@ -232,10 +190,6 @@ def encode_region_map(state,tokenizer,unet,width,height, scale_ratio=8, text_ids
                     print(f"tokens {k_as_tokens} not found in text")
 
             w_tensors[w_r * h_r] = torch.cat([ret_uncond_tensor, ret_cond_tensor]) if do_classifier_free_guidance else ret_cond_tensor
-            '''if do_classifier_free_guidance:
-                w_tensors[w_r * h_r] = torch.cat([ret_uncond_tensor, ret_cond_tensor])
-            else:
-                w_tensors[w_r * h_r] = ret_cond_tensor'''
             scale_ratio *= 2
 
         return w_tensors
