@@ -1,4 +1,4 @@
-# Implemented Spatial Control with Stable diffusion
+# Implemented Spatial Control with Stable Diffusion
 
 Recent advancements in diffusion models have demonstrated remarkable outcomes in text-to-image synthesis. However, relying solely on text prompt can introduce spatial ambiguity and limit user controllability. In this project, we introduce a free-training method to enhance spatial object placement in diffusion models without the need for additional training data or complex architectures. This method leverages the inherent cross-attention mechanism within diffusion models.
 
@@ -9,6 +9,7 @@ Recent advancements in diffusion models have demonstrated remarkable outcomes in
 - [Features](#features)
 - [Method](#method)
 - [Result](#result)
+- [Conclusion](#conclusion)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Contributing](#contributing)
@@ -85,6 +86,13 @@ For each prompt, the results utilized the same configurations and a region map. 
 
 #### IP-Adapter + ControlNet
 ![IP_adapter_control_net](Figure/Result_on_ipadapter_controlnet.png)
+
+## Conclusion
+
+- From the images generated with corresponding region maps, this method performs quite well across various cases and sizes of test images. However, due to its reliance on cross-attention refinement to highlight specific regions, there may be instances where it does not work optimally. For example, if the region of interest is relatively small or exhibits unusual characteristics, the model may fail to generate an appropriate image. 
+- Furthermore, if the positions of the objects are chosen by the user and the model has not been trained on those positions, it will not generate the desired images. In addition, to obtain the desired images, users need to set the input hyperparameters appropriately. If the  hyperparameters are set too high, the generated images will be very poor, while if the hyperparameters are set too low, they will not meet the user's expectations.
+
+
 ## Installation
 To use our project, follow these installation steps:
 ```bash
