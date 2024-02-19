@@ -41,7 +41,7 @@ The selection of hyperparameters in this method is crucial. As seen from [Figure
 ![Process](Figure/process/Process.svg)
 > Illustration of the method's process. The user has the ability to manipulate the placement of objects by choosing specific phrases, such as "lovely anime girl" and "bridge," and applying them to the canvas. The designated masks provided by the user contribute to elevating the significance of the respective phrases in the attention matrix within the cross-attention layers.
 
-The cross-attention maps of a Stable Diffusion by using DAAM with the prompt "A **lovely anime girl** sitting on a **bridge**." and chosing 2 pharses "lovely anime girl" and "bridge"
+The cross-attention maps of a Stable Diffusion by using [DAAM](https://github.com/castorini/daam/) with the prompt "A **lovely anime girl** sitting on a **bridge**." and chosing 2 pharses "lovely anime girl" and "bridge"
 > Without using method
 ![Cross-attention_before](Figure/process/process_before.png)
 > Using method
