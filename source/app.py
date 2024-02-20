@@ -993,7 +993,6 @@ def inference(
             "guidance_scale": guidance,
             "generator": generator,
             "region_map_state": state,
-            #"region_map_attn_weight": g_strength,
             "latent_processing": latent_processing,
             'weight_func':weight_func,
             'clip_skip' :int(clip_skip)-1,
