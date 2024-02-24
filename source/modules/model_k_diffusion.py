@@ -15,7 +15,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from modules.external_k_diffusion import CompVisDenoiser, CompVisVDenoiser
-from modules.prompt_parser import FrozenCLIPEmbedderWithCustomWords
 from torch import einsum
 from torch.autograd.function import Function
 
@@ -34,7 +33,8 @@ from modules.ip_adapter import IPAdapterMixin
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 import gc
 from modules.t2i_adapter import preprocessing_t2i_adapter,default_height_width
-
+from modules.encoder_prompt_modify import encode_prompt_function
+from modules.encode_region_map_function import encode_region_map
 
 def get_image_size(image):
     height, width = None, None
@@ -114,14 +114,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         self.controlnet = None
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.setup_unet(self.unet)
-        self.setup_text_encoder()
-
-    def setup_text_encoder(self, n=1, new_encoder=None):
-        if new_encoder is not None:
-            self.text_encoder = new_encoder
-
-        self.prompt_parser = FrozenCLIPEmbedderWithCustomWords(self.tokenizer, self.text_encoder,n)
-        #self.prompt_parser.CLIP_stop_at_last_layers = n
 
     def setup_unet(self, unet):
         unet = unet.to(self.device)
@@ -187,62 +179,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             image_embeds.append(single_image_embeds)
 
         return image_embeds
-
-    def encode_region_map(self, state,w,h, scale_ratio=8, text_ids=None):
-        uncond, cond = text_ids[0], text_ids[1]
-
-        if state is None:
-            return torch.FloatTensor(0)
-
-        w_tensors = dict()
-        cond = cond.tolist()
-        uncond = uncond.tolist()
-        for layer in self.unet.down_blocks:
-            c = int(len(cond))
-            w_r, h_r = int(math.ceil(w / scale_ratio)), int(math.ceil(h / scale_ratio))
-
-            ret_cond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
-            ret_uncond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
-
-            for k, v in state.items():
-                if v["map"] is None:
-                    continue
-                is_in = 0
-
-                k_as_tokens = self.tokenizer(
-                    k,
-                    max_length=self.tokenizer.model_max_length,
-                    truncation=True,
-                    add_special_tokens=False,
-                ).input_ids
-
-                region_map_resize = np.array(v["map"] < 255 ,dtype = np.uint8)
-                region_map_resize = cv2.resize(region_map_resize,(w_r,h_r),interpolation = cv2.INTER_CUBIC)
-                region_map_resize = (region_map_resize == np.max(region_map_resize)).astype(float)
-                region_map_resize = region_map_resize * float(v["weight"]) 
-                region_map_resize[region_map_resize==0] = -1 * float(v["mask_outsides"]) 
-                ret = torch.from_numpy(
-                    region_map_resize
-                )
-                ret = ret.reshape(-1, 1).repeat(1, len(k_as_tokens))
-
-                for idx, tok in enumerate(cond):
-                    if cond[idx : idx + len(k_as_tokens)] == k_as_tokens:
-                        is_in = 1
-                        ret_cond_tensor[0, :, idx : idx + len(k_as_tokens)] += ret
-
-                for idx, tok in enumerate(uncond):
-                    if uncond[idx : idx + len(k_as_tokens)] == k_as_tokens:
-                        is_in = 1
-                        ret_uncond_tensor[0, :, idx : idx + len(k_as_tokens)] += ret
-
-                if not is_in == 1:
-                    print(f"tokens {k_as_tokens} not found in text")
-
-            w_tensors[w_r * h_r] = torch.cat([ret_uncond_tensor, ret_cond_tensor])
-            scale_ratio *= 2
-
-        return w_tensors
 
     def enable_attention_slicing(self, slice_size: Optional[Union[str, int]] = "auto"):
         r"""
@@ -313,7 +249,8 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
 
     def decode_latents(self, latents):
         latents = latents.to(self.device, dtype=self.vae.dtype)
-        latents = 1 / 0.18215 * latents
+        #latents = 1 / 0.18215 * latents
+        latents = 1 / self.vae.config.scaling_factor * latents
         image = self.vae.decode(latents).sample
         image = (image / 2 + 0.5).clamp(0, 1)
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
@@ -342,7 +279,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
 
     @property
     def do_classifier_free_guidance(self):
-        return True and self.unet.config.time_cond_proj_dim is None
+        return self._do_classifier_free_guidance and self.unet.config.time_cond_proj_dim is None
 
     def setup_controlnet(self,controlnet):
         if isinstance(controlnet, (list, tuple)):
@@ -351,7 +288,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             controlnet=controlnet,
         )
 
-    def preprocess_controlnet(self,controlnet_conditioning_scale,control_guidance_start,control_guidance_end,image,width,height,num_inference_steps):
+    def preprocess_controlnet(self,controlnet_conditioning_scale,control_guidance_start,control_guidance_end,image,width,height,num_inference_steps,batch_size,num_images_per_prompt):
         controlnet = self.controlnet._orig_mod if is_compiled_module(self.controlnet) else self.controlnet
 
         # align format for control guidance
@@ -381,8 +318,8 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 image=image,
                 width=width,
                 height=height,
-                batch_size=1,
-                num_images_per_prompt=1,
+                batch_size=batch_size,
+                num_images_per_prompt=num_images_per_prompt,
                 device=self._execution_device,
                 dtype=controlnet.dtype,
                 do_classifier_free_guidance=self.do_classifier_free_guidance,
@@ -397,8 +334,8 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                     image=image_,
                     width=width,
                     height=height,
-                    batch_size=1,
-                    num_images_per_prompt=1,
+                    batch_size=batch_size,
+                    num_images_per_prompt=num_images_per_prompt,
                     device=self._execution_device,
                     dtype=controlnet.dtype,
                     do_classifier_free_guidance=self.do_classifier_free_guidance,
@@ -513,11 +450,27 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
 
         return image
     
+    def numpy_to_pil(self,images):
+        r"""
+        Convert a numpy image or a batch of images to a PIL image.
+        """
+        if images.ndim == 3:
+            images = images[None, ...]
+        images = (images * 255).round().astype("uint8")
+        if images.shape[-1] == 1:
+            # special case for grayscale (single channel) images
+            pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
+        else:
+            pil_images = [Image.fromarray(image) for image in images]
+
+        return pil_images
 
     def latent_to_image(self,latent,output_type):
         image = self.decode_latents(latent)
         if output_type == "pil":
             image = self.numpy_to_pil(image)
+        if len(image) > 1:
+            return image
         return image[0]
 
 
@@ -562,6 +515,9 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         adapter_conditioning_factor: float = 1.0,
         guidance_rescale: float = 0.0,
         cross_attention_kwargs = None,
+        clip_skip = None,
+        long_encode = 0,
+        num_images_per_prompt = 1,
     ):
         if isinstance(sampler_name, str):
             sampler = self.get_scheduler(sampler_name)
@@ -590,11 +546,28 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = True
-        if guidance_scale <= 1.0:
-            raise ValueError("has to use guidance_scale")
+
+        lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
+        self._do_classifier_free_guidance = False if guidance_scale <= 1.0 else True
         # 3. Encode input prompt
-        text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
+
+        text_embeddings, negative_prompt_embeds, text_input_ids = encode_prompt_function(
+            self,
+            prompt,
+            device,
+            num_images_per_prompt,
+            self.do_classifier_free_guidance,
+            negative_prompt,
+            lora_scale = lora_scale,
+            clip_skip = clip_skip,
+            long_encode = long_encode,
+        )
+
+        if self.do_classifier_free_guidance:
+            text_embeddings = torch.cat([negative_prompt_embeds, text_embeddings])
+
         text_embeddings = text_embeddings.to(self.unet.dtype)
 
         init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
@@ -621,12 +594,13 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             latents.device
         )
 
-        region_state = self.encode_region_map(
+        region_state = encode_region_map(
+            self,
             region_map_state,
-            w = width,
-            h = height,
-            scale_ratio = self.vae_scale_factor,
-            text_ids=text_ids,
+            width = width,
+            height = height,
+            num_images_per_prompt = num_images_per_prompt,
+            text_ids=text_input_ids,
         )
         if cross_attention_kwargs is None:
             cross_attention_kwargs ={}
@@ -637,28 +611,14 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         guess_mode = False
 
         if self.controlnet is not None:
-            img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,len(sigma_sched)  )
-            #print(len(controlnet_keep))
-
-            #controlnet_conditioning_scale_copy = controlnet_conditioning_scale.copy()
-        #sp_control = 1
+            img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,len(sigma_sched),batch_size,num_images_per_prompt)
 
         if ip_adapter_image is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image, device, 1
+                ip_adapter_image, device, batch_size * num_images_per_prompt
             )
         # 6.1 Add image embeds for IP-Adapter
         added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
-        #if controlnet_img is not None:
-            #controlnet_img_processing = controlnet_img.convert("RGB")
-            #transform = transforms.Compose([transforms.PILToTensor()])
-            #controlnet_img_processing = transform(controlnet_img)
-            #controlnet_img_processing=controlnet_img_processing.to(device=device, dtype=self.cnet.dtype)
-            #controlnet_img = torch.from_numpy(controlnet_img).half()
-            #controlnet_img = controlnet_img.unsqueeze(0)
-            #controlnet_img = controlnet_img.repeat_interleave(3, dim=0)
-            #controlnet_img=controlnet_img.to(device)
-            #controlnet_img = controlnet_img.repeat_interleave(4 // len(controlnet_img), 0)
         if latent_processing == 1:
             latents_process = [self.latent_to_image(latents,output_type)]
         lst_latent_sigma = []
@@ -673,7 +633,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             if start_time > 0 and timeout > 0:
                 assert (time.time() - start_time) < timeout, "inference process timed out"
 
-            latent_model_input = torch.cat([x] * 2)
+            latent_model_input = torch.cat([x] * 2) if self.do_classifier_free_guidance else x
             
             region_prompt = {
                 "region_state": region_state,
@@ -681,8 +641,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 "weight_func": weight_func,
               }
             cross_attention_kwargs["region_prompt"] = region_prompt
-
-            #print(self.k_diffusion_model.sigma_to_t(sigma[0]))
 
             if latent_model_input.dtype != text_embeddings.dtype:
                 latent_model_input = latent_model_input.to(text_embeddings.dtype)
@@ -701,7 +659,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             if self.controlnet is not None :
                 sigma_string = str(sigma.item())
                 if sigma_string not in lst_latent_sigma:
-                    #sigmas_sp = sigma.detach().clone()
                     step_control+=1
                     lst_latent_sigma.append(sigma_string)
 
@@ -738,18 +695,16 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             noise_pred = self.k_diffusion_model(
                 latent_model_input, sigma, cond=text_embeddings,cross_attention_kwargs = cross_attention_kwargs,down_intrablock_additional_residuals = down_intrablock_additional_residuals,added_cond_kwargs=added_cond_kwargs, **ukwargs
             )
-
-            
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
 
             if guidance_rescale > 0.0:
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
             if latent_processing == 1:
                 latents_process.append(self.latent_to_image(noise_pred,output_type))
-            # noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=0.7)
             return noise_pred
 
         sampler_args = self.get_sampler_extra_args_i2i(sigma_sched,len(sigma_sched),sampler_opt,latents,seed, sampler)
@@ -771,11 +726,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 mode=upscale_method,
                 antialias=upscale_antialias,
             )
-            #if controlnet_img is not None:
-                #controlnet_img = cv2.resize(controlnet_img,(latents.size(0), latents.size(1)))
-                #controlnet_img=controlnet_img.resize((latents.size(0), latents.size(1)), Image.LANCZOS)
-            
-            #region_map_state = apply_size_sketch(int(target_width),int(target_height),region_map_state)
             latent_reisze= self.img2img(
                 prompt=prompt,
                 num_inference_steps=num_inference_steps,
@@ -801,6 +751,9 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 adapter_conditioning_factor = adapter_conditioning_factor,
                 guidance_rescale = guidance_rescale,
                 cross_attention_kwargs = cross_attention_kwargs,
+                clip_skip = clip_skip,
+                long_encode = long_encode,
+                num_images_per_prompt = num_images_per_prompt,
             )
             if latent_processing == 1:
                 latents_process= latents_process+latent_reisze
@@ -808,7 +761,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             torch.cuda.empty_cache()
             gc.collect()
             return latent_reisze
-     
+    
         if latent_processing == 1:
             return latents_process
         self.maybe_free_model_hooks()
@@ -950,6 +903,9 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         adapter_conditioning_factor: float = 1.0,
         guidance_rescale: float = 0.0,
         cross_attention_kwargs = None,
+        clip_skip = None,
+        long_encode = 0,
+        num_images_per_prompt = 1,
     ):
         if isinstance(sampler_name, str):
             sampler = self.get_scheduler(sampler_name)
@@ -966,13 +922,28 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
         # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
         # corresponds to doing no classifier free guidance.
-        do_classifier_free_guidance = True
-        if guidance_scale <= 1.0:
-            raise ValueError("has to use guidance_scale")
 
+        lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
+        self._do_classifier_free_guidance = False if guidance_scale <= 1.0 else True
+        # 3. Encode input prompt
+
+        text_embeddings, negative_prompt_embeds, text_input_ids = encode_prompt_function(
+            self,
+            prompt,
+            device,
+            num_images_per_prompt,
+            self.do_classifier_free_guidance,
+            negative_prompt,
+            lora_scale = lora_scale,
+            clip_skip = clip_skip,
+            long_encode = long_encode,
+        )
+        if self.do_classifier_free_guidance:
+            text_embeddings = torch.cat([negative_prompt_embeds, text_embeddings])
 
         # 3. Encode input prompt
-        text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
         text_embeddings = text_embeddings.to(self.unet.dtype)
 
         # 4. Prepare timesteps
@@ -983,7 +954,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         # 5. Prepare latent variables
         num_channels_latents = self.unet.config.in_channels
         latents = self.prepare_latents(
-            batch_size,
+            batch_size * num_images_per_prompt,
             num_channels_latents,
             height,
             width,
@@ -999,12 +970,13 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             latents.device
         )
 
-        region_state = self.encode_region_map(
+        region_state = encode_region_map(
+            self,
             region_map_state,
-            w = width,
-            h = height,
-            scale_ratio = self.vae_scale_factor,
-            text_ids=text_ids,
+            width = width,
+            height = height,
+            num_images_per_prompt = num_images_per_prompt,
+            text_ids=text_input_ids,
         )
         if cross_attention_kwargs is None:
             cross_attention_kwargs ={}
@@ -1014,12 +986,12 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         guess_mode = False
 
         if self.controlnet is not None:
-            img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,num_inference_steps  )
-            
+            img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,num_inference_steps,batch_size,num_images_per_prompt)
+        
 
         if ip_adapter_image is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image, device, 1
+                ip_adapter_image, device, batch_size * num_images_per_prompt
             )
         # 6.1 Add image embeds for IP-Adapter
         added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
@@ -1038,15 +1010,13 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             if start_time > 0 and timeout > 0:
                 assert (time.time() - start_time) < timeout, "inference process timed out"
 
-            latent_model_input = torch.cat([x] * 2)
+            latent_model_input = torch.cat([x] * 2) if self.do_classifier_free_guidance else x
             region_prompt = {
                 "region_state": region_state,
                 "sigma": sigma[0],
                 "weight_func": weight_func,
               }
             cross_attention_kwargs["region_prompt"] = region_prompt
-
-
             if latent_model_input.dtype != text_embeddings.dtype:
                 latent_model_input = latent_model_input.to(text_embeddings.dtype)
             ukwargs = {}
@@ -1064,7 +1034,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             if self.controlnet is not None :
                 sigma_string = str(sigma.item())
                 if sigma_string not in lst_latent_sigma:
-                    #sigmas_sp = sigma.detach().clone()
                     step_control+=1
                     lst_latent_sigma.append(sigma_string)
 
@@ -1104,22 +1073,20 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             )
 
             
-            noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
-            noise_pred = noise_pred_uncond + guidance_scale * (
-                noise_pred_text - noise_pred_uncond
-            )
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
             if guidance_rescale > 0.0:
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
             if latent_processing == 1:
                 latents_process.append(self.latent_to_image(noise_pred,output_type))
-            # noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=0.7)
             return noise_pred
         extra_args = self.get_sampler_extra_args_t2i(
             sigmas, eta, num_inference_steps,sampler_opt,latents,seed, sampler
         )
         latents = sampler(model_fn, latents, **extra_args)
-        #latents = latents_process[0]
-        #print(len(latents_process))
         self.maybe_free_model_hooks()
         torch.cuda.empty_cache()
         gc.collect()
@@ -1137,9 +1104,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 antialias=upscale_antialias,
             )
             
-            #if controlnet_img is not None:
-                #controlnet_img = cv2.resize(controlnet_img,(latents.size(0), latents.size(1)))
-                #controlnet_img=controlnet_img.resize((latents.size(0), latents.size(1)), Image.LANCZOS)
             latent_reisze= self.img2img(
                 prompt=prompt,
                 num_inference_steps=num_inference_steps,
@@ -1165,8 +1129,10 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 adapter_conditioning_factor = adapter_conditioning_factor,
                 guidance_rescale = guidance_rescale,
                 cross_attention_kwargs = cross_attention_kwargs,
+                clip_skip = clip_skip,
+                long_encode = long_encode,
+                num_images_per_prompt = num_images_per_prompt,
             )
-            
             if latent_processing == 1:
                 latents_process= latents_process+latent_reisze
                 return latents_process
@@ -1174,6 +1140,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             gc.collect()
             return latent_reisze
 
+        # 8. Post-processing
         if latent_processing == 1:
             return latents_process
         return [self.latent_to_image(latents,output_type)]
