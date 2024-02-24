@@ -4,7 +4,6 @@ import math
 from pathlib import Path
 import re
 from collections import defaultdict
-from typing import List, Optional, Union
 import cv2
 import time
 import k_diffusion
@@ -15,7 +14,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
 from modules.external_k_diffusion import CompVisDenoiser, CompVisVDenoiser
-from modules.prompt_parser import FrozenCLIPEmbedderWithCustomWords
 from torch import einsum
 from torch.autograd.function import Function
 
@@ -39,9 +37,12 @@ from diffusers.models.lora import adjust_lora_scale_text_encoder
 from diffusers.models import AutoencoderKL, ImageProjection
 from diffusers.schedulers import KarrasDiffusionSchedulers
 from diffusers.utils import (
+    USE_PEFT_BACKEND,
     deprecate,
     logging,
     replace_example_docstring,
+    scale_lora_layers,
+    unscale_lora_layers,
 )
 from diffusers.loaders import FromSingleFileMixin, LoraLoaderMixin, TextualInversionLoaderMixin
 from  diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
@@ -51,7 +52,8 @@ from diffusers.configuration_utils import FrozenDict
 from diffusers.pipelines.controlnet.multicontrolnet import MultiControlNetModel
 from modules.ip_adapter import IPAdapterMixin
 from modules.t2i_adapter import preprocessing_t2i_adapter,default_height_width
- 
+from modules.encoder_prompt_modify import encode_prompt_function 
+from modules.encode_region_map_function import encode_region_map
 
 
 def get_image_size(image):
@@ -70,129 +72,6 @@ def get_image_size(image):
         return (width, height) 
     else:
         raise TypeError("The image must be an instance of PIL.Image, numpy.ndarray, or torch.Tensor.")
-
-#Get id token of text at present only support for batch_size = 1 because prompt is a string ("For easy to handle")
-#Class_name is the name of the class for example StableDiffusion
-def get_id_text(class_name,prompt,max_length,negative_prompt = None,prompt_embeds: Optional[torch.FloatTensor] = None,negative_prompt_embeds: Optional[torch.FloatTensor] = None):
-    #Check prompt_embeds is None -> not using prompt as input 
-    if prompt_embeds is not None or negative_prompt_embeds is not None :
-        return None,None
-    
-    if prompt is not None and isinstance(prompt, str):
-        batch_size = 1
-    elif prompt is not None and isinstance(prompt, list):
-        batch_size = len(prompt)
-    else:
-        batch_size = prompt_embeds.shape[0]
-
-    if isinstance(class_name, TextualInversionLoaderMixin):
-        prompt = class_name.maybe_convert_prompt(prompt, class_name.tokenizer)
-    
-    text_inputs = class_name.tokenizer(
-        prompt,
-        padding="max_length",
-        max_length=class_name.tokenizer.model_max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    text_input_ids = text_inputs.input_ids.detach().cpu().numpy()
-
-    uncond_tokens: List[str]
-    if negative_prompt is None:
-        uncond_tokens = [""] * batch_size
-    elif prompt is not None and type(prompt) is not type(negative_prompt):
-        raise TypeError(
-            f"`negative_prompt` should be the same type to `prompt`, but got {type(negative_prompt)} !="
-            f" {type(prompt)}."
-        )
-    elif isinstance(negative_prompt, str):
-        uncond_tokens = [negative_prompt]
-    elif batch_size != len(negative_prompt):
-        raise ValueError(
-            f"`negative_prompt`: {negative_prompt} has batch size {len(negative_prompt)}, but `prompt`:"
-            f" {prompt} has batch size {batch_size}. Please make sure that passed `negative_prompt` matches"
-            " the batch size of `prompt`."
-        )
-    else:
-        uncond_tokens = negative_prompt
-
-    # textual inversion: procecss multi-vector tokens if necessary
-    if isinstance(class_name, TextualInversionLoaderMixin):
-        uncond_tokens = class_name.maybe_convert_prompt(uncond_tokens, class_name.tokenizer)
-
-    uncond_input = class_name.tokenizer(
-        uncond_tokens,
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    uncond_input_ids = uncond_input.input_ids.detach().cpu().numpy()
-
-
-    if batch_size == 1:
-        return text_input_ids.reshape((1,-1)),uncond_input_ids.reshape((1,-1))
-    return text_input_ids,uncond_input_ids
-
-
-
-#Support for find the region of object
-def encode_region_map(state,tokenizer,unet,width,height, scale_ratio=8, text_ids=None,do_classifier_free_guidance = True):
-        if state is None or text_ids is None:
-            return torch.FloatTensor(0)
-        uncond, cond = text_ids[0], text_ids[1]
-
-        w_tensors = dict()
-        cond = cond.tolist()
-        uncond = uncond.tolist()
-        for layer in unet.down_blocks:
-            c = int(len(cond))
-            w_r, h_r = int(math.ceil(width / scale_ratio)), int(math.ceil(height / scale_ratio))
-
-            ret_cond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
-            ret_uncond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
-
-            for k, v in state.items():
-                if v["map"] is None:
-                    continue
-                is_in = 0
-
-                k_as_tokens = tokenizer(
-                    k,
-                    max_length=tokenizer.model_max_length,
-                    truncation=True,
-                    add_special_tokens=False,
-                ).input_ids
-
-                region_map_resize = np.array(v["map"] < 255 ,dtype = np.uint8)
-                region_map_resize = cv2.resize(region_map_resize,(w_r,h_r),interpolation = cv2.INTER_CUBIC)
-                region_map_resize = (region_map_resize == np.max(region_map_resize)).astype(float)
-                region_map_resize = region_map_resize * float(v["weight"]) 
-                region_map_resize[region_map_resize==0] = -1 * float(v["mask_outsides"]) 
-                ret = torch.from_numpy(
-                    region_map_resize
-                )
-                ret = ret.reshape(-1, 1).repeat(1, len(k_as_tokens))
-
-                for idx, tok in enumerate(cond):
-                    if cond[idx : idx + len(k_as_tokens)] == k_as_tokens:
-                        is_in = 1
-                        ret_cond_tensor[0, :, idx : idx + len(k_as_tokens)] += ret
-
-                for idx, tok in enumerate(uncond):
-                    if uncond[idx : idx + len(k_as_tokens)] == k_as_tokens:
-                        is_in = 1
-                        ret_uncond_tensor[0, :, idx : idx + len(k_as_tokens)] += ret
-
-                if not is_in == 1:
-                    print(f"tokens {k_as_tokens} not found in text")
-
-            w_tensors[w_r * h_r] = torch.cat([ret_uncond_tensor, ret_cond_tensor]) if do_classifier_free_guidance else ret_cond_tensor
-            scale_ratio *= 2
-
-        return w_tensors
 
 # from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
@@ -295,8 +174,6 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
         ip_adapter_image: Optional[PipelineImageInput] = None,
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
-        #callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        #callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         guidance_rescale: float = 0.0,
         clip_skip: Optional[int] = 0,
@@ -308,6 +185,7 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
         image_t2i_adapter : Optional[PipelineImageInput] = None,
         adapter_conditioning_scale: Union[float, List[float]] = 1.0,
         adapter_conditioning_factor: float = 1.0,
+        long_encode: int = 0,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -326,14 +204,10 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
                 "Passing `callback_steps` as an input argument to `__call__` is deprecated, consider using `callback_on_step_end`",
             )
 
-        #self.prompt_parser = FrozenCLIPEmbedderWithCustomWords(self.tokenizer, self.text_encoder,clip_skip+1)
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
         width = width or self.unet.config.sample_size * self.vae_scale_factor
-        # to deal with lora scaling and other possible forward hooks
-        
-            
-        
+        # to deal with lora scaling and other possible forward hooks   
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -356,7 +230,6 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
         if image_t2i_adapter is not None:
             height, width = default_height_width(self,height, width, image_t2i_adapter)
             adapter_state = preprocessing_t2i_adapter(self,image_t2i_adapter,width,height,adapter_conditioning_scale,num_images_per_prompt)
-            #print(default_height_width(self,height, width, image_t2i_adapter))
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -376,23 +249,8 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
         lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-        #print(type(negative_prompt))
-        #print(type(prompt))
-        if negative_prompt is None:
-          negative_prompt = ''
-        if prompt is None:
-          prompt =''
-        #text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
-        #text_embeddings = text_embeddings.to(self.unet.dtype)
-        #print(text_embeddings)
-        #Copy prompt_embed of input for support get token_id
-        prompt_embeds_copy = None
-        negative_prompt_embeds_copy = None
-        if prompt_embeds is not None:
-            prompt_embeds_copy = prompt_embeds.clone().detach()
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds_copy = negative_prompt_embeds.clone().detach()
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds,text_input_ids = encode_prompt_function(
+            self,
             prompt,
             device,
             num_images_per_prompt,
@@ -402,15 +260,9 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=lora_scale,
             clip_skip=self.clip_skip,
+            long_encode = long_encode,
         )
 
-        #Get token_id
-        text_input_ids,uncond_input_ids = get_id_text(self,prompt,max_length = prompt_embeds.shape[1],negative_prompt = negative_prompt,prompt_embeds = prompt_embeds_copy,negative_prompt_embeds = negative_prompt_embeds_copy)
-        # For classifier free guidance, we need to do two forward passes.
-        # Here we concatenate the unconditional and text embeddings into a single batch
-        # to avoid doing two forward passes
-        if text_input_ids is not None:
-            text_input_ids = np.concatenate([uncond_input_ids, text_input_ids])
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds])
 
@@ -420,19 +272,16 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
             )
 
         # 4. Prepare timesteps
-        #print(prompt_embeds)
         timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device, timesteps)
 
         #4.1 Prepare region 
         region_state = encode_region_map(
+            self,
             region_map_state,
-            tokenizer = self.tokenizer,
-            unet = self.unet,
             width = width,
             height = height,
-            scale_ratio = self.vae_scale_factor,
+            num_images_per_prompt = num_images_per_prompt,
             text_ids=text_input_ids,
-            do_classifier_free_guidance = self.do_classifier_free_guidance,
         )
         if self.cross_attention_kwargs is None:
             self._cross_attention_kwargs ={}
@@ -465,16 +314,11 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
                 guidance_scale_tensor, embedding_dim=self.unet.config.time_cond_proj_dim
             ).to(device=device, dtype=latents.dtype)
 
-        #print(self.scheduler.sigmas)
-        #print(len(self.scheduler.sigmas))
-        #values, indices = torch.sort(self.scheduler.sigmas, descending=True)
-        #print(self.scheduler.sigmas)
         # 7. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            #step_x = 0
             for i, t in enumerate(timesteps):
 
                 if self.interrupt:
@@ -483,7 +327,6 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
-                #print(self.scheduler.sigmas[step_x])
 
                 region_prompt = {
                 "region_state": region_state,
@@ -491,10 +334,6 @@ class StableDiffusionPipeline_finetune(IPAdapterMixin,StableDiffusionPipeline):
                 "weight_func": weight_func,
               }
                 self._cross_attention_kwargs["region_prompt"] = region_prompt
-                #print(t)
-                #step_x=step_x+1
-
-                #tensor_data = {k: torch.Tensor(v) for k, v in encoder_state.items()}
                 # predict the noise residual
                 down_intrablock_additional_residuals = None
                 if adapter_state is not None:
@@ -600,8 +439,6 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         guidance_rescale: float = 0.0,
-        #callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        #callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_conditioning_scale: Union[float, List[float]] = 1.0,
         guess_mode: bool = False,
@@ -616,6 +453,7 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
         image_t2i_adapter : Optional[PipelineImageInput] = None,
         adapter_conditioning_scale: Union[float, List[float]] = 1.0,
         adapter_conditioning_factor: float = 1.0,
+        long_encode: int = 0,
         **kwargs,
     ):
         callback = kwargs.pop("callback", None)
@@ -707,17 +545,8 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
 
-        #text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
-        #text_embeddings = text_embeddings.to(self.unet.dtype)
-
-        #Copy input prompt_embeds and negative_prompt_embeds
-        prompt_embeds_copy = None
-        negative_prompt_embeds_copy = None
-        if prompt_embeds is not None:
-            prompt_embeds_copy = prompt_embeds.clone().detach()
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds_copy = negative_prompt_embeds.clone().detach()
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds,text_input_ids = encode_prompt_function(
+            self,
             prompt,
             device,
             num_images_per_prompt,
@@ -727,11 +556,9 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
+            long_encode = long_encode,
         )
-        #Get token_id
-        text_input_ids,uncond_input_ids = get_id_text(self,prompt,max_length = prompt_embeds.shape[1],negative_prompt = negative_prompt,prompt_embeds = prompt_embeds_copy,negative_prompt_embeds = negative_prompt_embeds_copy)
-        if text_input_ids is not None:
-            text_input_ids = np.concatenate([uncond_input_ids, text_input_ids])
+
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -744,8 +571,6 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
                 ip_adapter_image, device, batch_size * num_images_per_prompt
             )
 
-        #if height is None and width is None:
-            #height, width = image.shape[-2:]
         
         # 4. Prepare image
         if isinstance(controlnet, ControlNetModel):
@@ -793,14 +618,12 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
 
         # 6. Prepare latent variables
         region_state = encode_region_map(
+            self,
             region_map_state,
-            tokenizer = self.tokenizer,
-            unet = self.unet,
             width = width,
             height = height,
-            scale_ratio = self.vae_scale_factor,
+            num_images_per_prompt = num_images_per_prompt,
             text_ids=text_input_ids,
-            do_classifier_free_guidance = self.do_classifier_free_guidance,
         )
         if self.cross_attention_kwargs is None:
             self._cross_attention_kwargs ={}
@@ -847,7 +670,6 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
         is_controlnet_compiled = is_compiled_module(self.controlnet)
         is_torch_higher_equal_2_1 = is_torch_version(">=", "2.1")
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            #step_x = 0
             for i, t in enumerate(timesteps):
                 # Relevant thread:
                 # https://dev-discuss.pytorch.org/t/cudagraphs-in-pytorch-2-0/1428
@@ -898,8 +720,6 @@ class StableDiffusionControlNetPipeline_finetune(IPAdapterMixin,StableDiffusionC
                 "weight_func": weight_func,
               }
                 self._cross_attention_kwargs["region_prompt"] = region_prompt
-                #print(t)
-                #step_x=step_x+1
 
                 down_intrablock_additional_residuals = None
                 if adapter_state is not None:
@@ -1014,8 +834,6 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         guidance_rescale: float = 0.0,
-        #callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        #callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         controlnet_conditioning_scale: Union[float, List[float]] = 0.8,
         guess_mode: bool = False,
@@ -1030,6 +848,7 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
         image_t2i_adapter : Optional[PipelineImageInput] = None,
         adapter_conditioning_scale: Union[float, List[float]] = 1.0,
         adapter_conditioning_factor: float = 1.0,
+        long_encode: int = 0,
         **kwargs,
     ):
         init_step = num_inference_steps
@@ -1056,9 +875,6 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
         if width is None:
             width,_ = get_image_size(image)
             width = int((width // 8)*8) 
-
-        
-
 
         # align format for control guidance
         if not isinstance(control_guidance_start, list) and isinstance(control_guidance_end, list):
@@ -1096,7 +912,6 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
             height, width = default_height_width(self,height, width, image_t2i_adapter)
             adapter_state = preprocessing_t2i_adapter(self,image_t2i_adapter,width,height,adapter_conditioning_scale,num_images_per_prompt)
 
-        #self.prompt_parser = FrozenCLIPEmbedderWithCustomWords(self.tokenizer, self.text_encoder,clip_skip+1)
 
         # 2. Define call parameters
         if prompt is not None and isinstance(prompt, str):
@@ -1126,18 +941,8 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
         text_encoder_lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-        #text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
-        #text_embeddings = text_embeddings.to(self.unet.dtype)
-
-        #Copy input prompt_embeds and negative_prompt_embeds
-        prompt_embeds_copy = None
-        negative_prompt_embeds_copy = None
-        if prompt_embeds is not None:
-            prompt_embeds_copy = prompt_embeds.clone().detach()
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds_copy = negative_prompt_embeds.clone().detach()
-
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds,text_input_ids = encode_prompt_function(
+            self,
             prompt,
             device,
             num_images_per_prompt,
@@ -1147,11 +952,8 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
+            long_encode = long_encode,
         )
-        #Get token_id
-        text_input_ids,uncond_input_ids = get_id_text(self,prompt,max_length = prompt_embeds.shape[1],negative_prompt = negative_prompt,prompt_embeds = prompt_embeds_copy,negative_prompt_embeds = negative_prompt_embeds_copy)
-        if text_input_ids is not None:
-            text_input_ids = np.concatenate([uncond_input_ids, text_input_ids])
         # For classifier free guidance, we need to do two forward passes.
         # Here we concatenate the unconditional and text embeddings into a single batch
         # to avoid doing two forward passes
@@ -1207,14 +1009,12 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
 
         # 5. Prepare timesteps
         region_state = encode_region_map(
+            self,
             region_map_state,
-            tokenizer = self.tokenizer,
-            unet = self.unet,
             width = width,
             height = height,
-            scale_ratio = self.vae_scale_factor,
+            num_images_per_prompt = num_images_per_prompt,
             text_ids=text_input_ids,
-            do_classifier_free_guidance = self.do_classifier_free_guidance,
         )
         if self.cross_attention_kwargs is None:
             self._cross_attention_kwargs ={}
@@ -1257,7 +1057,6 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
         # 8. Denoising loop
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            #step_x = 0
             for i, t in enumerate(timesteps):
                 # expand the latents if we are doing classifier free guidance
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
@@ -1304,8 +1103,6 @@ class StableDiffusionControlNetImg2ImgPipeline_finetune(IPAdapterMixin,StableDif
                 "weight_func": weight_func,
               }
                 self._cross_attention_kwargs["region_prompt"] = region_prompt
-                #print(t)
-                #step_x=step_x+1
 
                 down_intrablock_additional_residuals = None
                 if adapter_state is not None:
@@ -1419,8 +1216,6 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
         output_type: Optional[str] = "pil",
         return_dict: bool = True,
         guidance_rescale: float = 0.0,
-        #callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
-        #callback_steps: int = 1,
         cross_attention_kwargs: Optional[Dict[str, Any]] = None,
         clip_skip: int = 0,
         region_map_state=None,
@@ -1431,6 +1226,7 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
         image_t2i_adapter : Optional[PipelineImageInput] = None,
         adapter_conditioning_scale: Union[float, List[float]] = 1.0,
         adapter_conditioning_factor: float = 1.0,
+        long_encode: int = 0,
         **kwargs,
     ):
         init_step = num_inference_steps
@@ -1462,8 +1258,6 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
             negative_prompt_embeds,
             callback_on_step_end_tensor_inputs,
         )
-
-        #self.prompt_parser = FrozenCLIPEmbedderWithCustomWords(self.tokenizer, self.text_encoder,clip_skip+1)
 
 
         self._guidance_scale = guidance_scale
@@ -1498,15 +1292,9 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
         text_encoder_lora_scale = (
             self.cross_attention_kwargs.get("scale", None) if self.cross_attention_kwargs is not None else None
         )
-        #Copy input prompt_embeds and negative_prompt_embeds
-        prompt_embeds_copy = None
-        negative_prompt_embeds_copy = None
-        if prompt_embeds is not None:
-            prompt_embeds_copy = prompt_embeds.clone().detach()
-        if negative_prompt_embeds is not None:
-            negative_prompt_embeds_copy = negative_prompt_embeds.clone().detach()
 
-        prompt_embeds, negative_prompt_embeds = self.encode_prompt(
+        prompt_embeds, negative_prompt_embeds,text_input_ids = encode_prompt_function(
+            self,
             prompt,
             device,
             num_images_per_prompt,
@@ -1516,11 +1304,9 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
             negative_prompt_embeds=negative_prompt_embeds,
             lora_scale=text_encoder_lora_scale,
             clip_skip=self.clip_skip,
+            long_encode = long_encode,
         )
-        #Get token_id
-        text_input_ids,uncond_input_ids = get_id_text(self,prompt,max_length = prompt_embeds.shape[1],negative_prompt = negative_prompt,prompt_embeds = prompt_embeds_copy,negative_prompt_embeds = negative_prompt_embeds_copy)
-        if text_input_ids is not None:
-            text_input_ids = np.concatenate([uncond_input_ids, text_input_ids])
+
         #text_ids, text_embeddings = self.prompt_parser([negative_prompt, prompt])
         #text_embeddings = text_embeddings.to(self.unet.dtype)
         # For classifier free guidance, we need to do two forward passes.
@@ -1539,14 +1325,12 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
 
         # 5. set timesteps
         region_state = encode_region_map(
+            self,
             region_map_state,
-            tokenizer = self.tokenizer,
-            unet = self.unet,
             width = width,
             height = height,
-            scale_ratio = self.vae_scale_factor,
+            num_images_per_prompt = num_images_per_prompt,
             text_ids=text_input_ids,
-            do_classifier_free_guidance = self.do_classifier_free_guidance,
         )
         if self.cross_attention_kwargs is None:
             self._cross_attention_kwargs ={}
@@ -1588,7 +1372,6 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
         num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
         self._num_timesteps = len(timesteps)
         with self.progress_bar(total=num_inference_steps) as progress_bar:
-            #step_x = 0
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
@@ -1603,9 +1386,6 @@ class StableDiffusionImg2ImgPipeline_finetune(IPAdapterMixin,StableDiffusionImg2
                 "weight_func": weight_func,
               }
                 self._cross_attention_kwargs["region_prompt"] = region_prompt
-                #print(t)
-                #step_x=step_x+1
-
                 down_intrablock_additional_residuals = None
                 if adapter_state is not None:
                     if i < int(num_inference_steps * adapter_conditioning_factor):
