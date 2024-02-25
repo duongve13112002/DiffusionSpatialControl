@@ -46,6 +46,7 @@ from PIL import Image,ImageOps
 from pathlib import Path
 from safetensors.torch import load_file
 import modules.safe as _
+from modules.lora import LoRANetwork
 import os
 import cv2
 from controlnet_aux import PidiNetDetector, HEDdetector,LineartAnimeDetector,LineartDetector,MLSDdetector,OpenposeDetector,MidasDetector,NormalBaeDetector,ContentShuffleDetector,ZoeDetector
@@ -64,6 +65,12 @@ lora_lst = ['Not using Lora']
 formula = [
     ['w = token_weight_martix * sigma * std(qk)',0],
 ]
+
+encoding_type ={
+    "Automatic111 Encoding": 0,
+    "Long Prompt Encoding": 1,
+    "Short Prompt Encoding": 2,
+}
 model_ip_adapter_lst = ['IP-Adapter','IP-Adapter VIT-G','IP-Adapter Light','IP-Adapter Face','IP-Adapter Plus','IP-Adapter Plus Face']
 
 model_ip_adapter_type = {
@@ -250,7 +257,6 @@ samplers_diffusers = [
 ]
 
 
-
 start_time = time.time()
 timeout = 360
 
@@ -258,7 +264,6 @@ scheduler = DDIMScheduler.from_pretrained(
     base_model,
     subfolder="scheduler",
 )
-
 vae = AutoencoderKL.from_pretrained(base_model,
     subfolder="vae",
     torch_dtype=torch.float16
@@ -315,7 +320,9 @@ unet_cache = {
     base_model: unet
 }
 
-
+lora_cache = {
+    base_model: LoRANetwork(text_encoder, unet)
+}
 tokenizer_cache ={
     base_model: tokenizer
 }
@@ -369,7 +376,6 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
         vae_cache[model] = vae_model
         tokenizer_cache[model] = tokenizer
         feature_cache[model] = feature_extract
-
     if current_model != model:
         unet_cache[current_model].to(device)
         te_cache[current_model].to(device)
@@ -432,8 +438,7 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
                     feature_extractor=local_feature,
                     requires_safety_checker = False,
                 ).to(device)
-    else:
-        
+    else:        
         pipe = StableDiffusionPipeline(
             text_encoder=local_te,
             tokenizer=local_token,
@@ -454,7 +459,6 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
     if diffuser_pipeline == False:
         pipe.setup_unet(pipe.unet)
         pipe.tokenizer.prepare_for_tokenization = local_token.prepare_for_tokenization
-        pipe.setup_text_encoder(clip_skip, local_te)
     torch.cuda.empty_cache()
     gc.collect()
     return pipe
@@ -699,11 +703,9 @@ def control_net_preprocessing(control_net_model,img_control,low_threshold = None
     elif control_net_model == 'Lineart (anime)':
         processor = LineartAnimeDetector.from_pretrained("lllyasviel/Annotators").to(device)
         img_control = processor(img_control)
-        #img_control = np.array(img_control)
     elif control_net_model == 'Lineart':
         processor = LineartDetector.from_pretrained("lllyasviel/Annotators").to(device)
         img_control = processor(img_control)
-        #img_control = np.array(img_control)
     elif control_net_model == 'MLSD':
         processor = MLSDdetector.from_pretrained("lllyasviel/ControlNet").to(device)
         img_control = processor(img_control)
@@ -762,7 +764,7 @@ def add_embedding(pipe_model,embs):
 def mask_region_apply_ip_adapter(mask):
     if mask is None:
         return None
-    # black is region masked
+    #define black is region masked
     if not isinstance(mask,List):
         mask = [mask]
     mask = [ImageOps.invert(i).convert('RGB') for i in mask]
@@ -840,8 +842,9 @@ def inference(
     ip_adapter_multi = False,
     guidance_rescale = 0,
     inf_control_adapt_image = None,
+    long_encode = 0,
 ):
-    global formula,controlnet_type,lst_control,lst_adapter,model_ip_adapter_type,adapter_type,lst_ip_adapter,current_number_ip_adapter
+    global formula,controlnet_type,lst_control,lst_adapter,model_ip_adapter_type,adapter_type,lst_ip_adapter,current_number_ip_adapter,encoding_type
     img_control_input = None
     device = "cpu"
     if torch.cuda.is_available():
@@ -931,10 +934,8 @@ def inference(
     lora_state = lora_dict[lora_state]
     pipe = setup_model(model,clip_skip, lora_state, lora_scale,diffuser_pipeline,control_net_model,img_input,device)
     generator = torch.Generator(device).manual_seed(int(seed))
-
     
     weight_func = lambda w, sigma, qk: w * sigma * qk.std()
-
 
     start_time = time.time()
 
@@ -947,8 +948,11 @@ def inference(
         height_resize_mask_ipadapter = img_input.height    
     setup_model_t2i_adapter(pipe,model_adapter)
     cross_attention_kwargs = {}
+
+    #Get type encoding
+    long_encode = encoding_type[long_encode]
+
     if ip_adapter == True:
-        #inf_adapt_image = None
         if ip_adapter_multi and len(lst_ip_adapter) > 0:
             ip_adapter_image_lst =[]
             model_ip_adapter_lst = []
@@ -985,7 +989,6 @@ def inference(
         output_type = 'pil'
         if hr_enabled and img_input is None:
             output_type = 'latent'
-        #Need to reduce clip_skip by 1 because when using clip_skip the value will increase in the encode_prompt 
         config = {
             "prompt": prompt,
             "negative_prompt": neg_prompt,
@@ -995,12 +998,13 @@ def inference(
             "region_map_state": state,
             "latent_processing": latent_processing,
             'weight_func':weight_func,
-            'clip_skip' :int(clip_skip)-1,
+            'clip_skip' :int(clip_skip),
             "output_type" : output_type,
             "image_t2i_adapter":adapter_img,
             "adapter_conditioning_scale":adapter_conditioning_scale,
             "adapter_conditioning_factor":adapter_conditioning_factor,
             "guidance_rescale":guidance_rescale,
+            "long_encode" : int(long_encode),
             "cross_attention_kwargs": cross_attention_kwargs
         }
         
@@ -1048,6 +1052,7 @@ def inference(
                 "adapter_conditioning_scale":adapter_conditioning_scale,
                 "adapter_conditioning_factor":adapter_conditioning_factor,
                 "guidance_rescale":guidance_rescale,
+                "long_encode" : int(long_encode),
                 "cross_attention_kwargs":cross_attention_kwargs,
             }
             if control_net_model is not None:
@@ -1086,6 +1091,8 @@ def inference(
             "adapter_conditioning_scale":adapter_conditioning_scale,
             "adapter_conditioning_factor":adapter_conditioning_factor,
             "guidance_rescale":guidance_rescale,
+            'clip_skip' :int(clip_skip),
+            "long_encode" : int(long_encode),
             "cross_attention_kwargs":cross_attention_kwargs,
         }
         pipe.setup_controlnet(control_net_model)
@@ -1425,6 +1432,7 @@ def apply_image(image, selected, w, h, strength, mask, state,inf_image):
                 "mask_outsides": mask
             }
     return state, gr.Image.update(value=create_mixed_img(selected, state, w_change, h_change))
+#rendered, apply_style, apply_clustering_style,Previous,Next,Completed,sp2,sp3
 def apply_base_on_color(sp2,state, width, height,inf_image):
     global number_clustering,clustering_image
     if inf_image is not None:
@@ -1460,6 +1468,7 @@ def next_image_page(sp3):
     if number_clustering >= len(clustering_image):
         number_clustering = 0
     return gr.Image.update(value = clustering_image[number_clustering])
+# [ti_state, lora_state, ti_vals, lora_vals, uploads]
 def add_net(files):
     if files is None:
         return gr.CheckboxGroup.update(choices=list(embeddings_dict.keys())),gr.Dropdown.update(choices=[k for k in lora_lst],value=lora_lst[0],),gr.File.update(value=None),
@@ -1486,6 +1495,7 @@ def add_net(files):
     return gr.CheckboxGroup.update(choices=list(embeddings_dict.keys())),gr.Dropdown.update(choices=[k for k in lora_lst],value=lora_lst[0],),gr.File.update(value=None),
 
 
+# [ti_state, lora_state, ti_vals, lora_vals, uploads]
 def clean_states(ti_state):
     global lora_dict
     global embeddings_dict
@@ -1555,19 +1565,18 @@ def lora_delete(lora_vals):
     lora_dict.pop(lora_vals)
     lora_lst.remove(lora_vals)
     return gr.Dropdown.update(choices=[k for k in lora_lst],value=lora_lst[0],)
-
+#diffuser_pipeline,sampler,gallery,hr_enabled
 def mode_diffuser_pipeline( controlnet_enabled):
     if controlnet_enabled == True:
         return gr.Checkbox.update(value = True),gr.Checkbox.update()
     return gr.Checkbox.update(value = False),gr.Checkbox.update(value = False)
-
 
 def res_cap(g, w, h, x):
     if g:
         return f"Enable upscaler: {w}x{h} to {int(w*x)}x{int(h*x)}"
     else:
         return "Enable upscaler"
-
+#diffuser_pipeline,hr_enabled,sampler,gallery,controlnet_enabled
 def mode_upscale(diffuser_pipeline, hr_scale, width, height,hr_enabled):
     if hr_enabled == True:
         return gr.Checkbox.update(value = False),gr.Checkbox.update(value = True,label=res_cap(True, width, height, hr_scale)),gr.Dropdown.update(value="DPM++ 2M Karras",choices=[s[0] for s in samplers_k_diffusion]),gr.Checkbox.update(value = False)
@@ -1588,7 +1597,7 @@ def change_control_net(model_control_net, low_threshold, high_threshold,has_body
 
 previous_sampler = 'DPM++ 2M Karras'
 previous_sampler_hires = 'DPM++ 2M Karras'
-
+#sampler,gallery,hr_enabled,controlnet_enabled
 def mode_diffuser_pipeline_sampler(diffuser_pipeline, sampler,sampler_hires):
     global previous_sampler, previous_sampler_hires
     sample_now = previous_sampler
@@ -2086,13 +2095,13 @@ with gr.Blocks(css=css) as demo:
 
                         prompt = gr.Textbox(
                             label="Prompt",
-                            value="A girl sitting on a bridge",
+                            value="A lovely girl sitting on a bridge",
                             show_label=True,
                             placeholder="Enter prompt.",
                         )
                         neg_prompt = gr.Textbox(
                             label="Negative Prompt",
-                            value="bad quality, low quality, jpeg artifact, cropped",
+                            value="bad quality",
                             show_label=True,
                             placeholder="Enter negative prompt.",
                         )
@@ -2116,9 +2125,6 @@ with gr.Blocks(css=css) as demo:
                         guidance_rescale = gr.Slider(
                             label="Guidance rescale", value=0, maximum=20
                         )
-                        steps = gr.Slider(
-                            label="Steps", value=25, minimum=2, maximum=100, step=1
-                        )
                     with gr.Row():
                         width = gr.Slider(
                             label="Width", value=512, minimum=64, maximum=1920, step=8
@@ -2129,6 +2135,15 @@ with gr.Blocks(css=css) as demo:
                     with gr.Row():
                         clip_skip = gr.Slider(
                             label="Clip Skip", value=2, minimum=1, maximum=12, step=1
+                        )
+                        steps = gr.Slider(
+                            label="Steps", value=25, minimum=2, maximum=100, step=1
+                        )
+                    with gr.Row():   
+                        long_encode = sampler = gr.Dropdown(
+                            value="Automatic111 Encoding",
+                            label="Encoding prompt type",
+                            choices=[s for s in encoding_type],
                         )
                         sampler = gr.Dropdown(
                             value="DPM++ 2M Karras",
@@ -2233,13 +2248,13 @@ with gr.Blocks(css=css) as demo:
                             label="IP-Adapter", source="upload", type="pil"
                         )
                         inf_control_adapt_image = gr.Image(
-                            label="Region apply (The black area represents the marked region)", source="upload", type="pil",image_mode='L'
+                            label="Region apply", source="upload", type="pil",image_mode='L'
                         )
                         inf_adapt_image_multi = gr.Image(
                             label="IP-Adapter", source="upload", type="pil",visible= False
                         )
                         inf_control_adapt_image_multi = gr.Image(
-                            label="Region apply", source="upload", type="pil",image_mode='L',visible= False
+                            label="Region apply(Black masks are the regions you want to apply)", source="upload", type="pil",image_mode='L',visible= False
                         )
                     inf_adapt_image_strength = gr.Slider(
                         label="IP-Adapter scale",
@@ -2441,7 +2456,6 @@ with gr.Blocks(css=css) as demo:
                         adapter_enabled = gr.Checkbox(label="Enable T2I Adapter", value=False)
                         disable_preprocessing_adapter = gr.Checkbox(label="Disable preprocessing", value=False)
                         multi_adapter = gr.Checkbox(label="Enable Multi T2I Adapter", value=False)
-                    #sketch_enabled = gr.Checkbox(label="Sketch image", value=False)
                     model_adapter = gr.Dropdown(
                         choices=[k for k in adapter_lst],
                         label="Model Controlnet",
@@ -2470,9 +2484,6 @@ with gr.Blocks(css=css) as demo:
                         adapter_conditioning_factor = gr.Slider(
                             label="Conditioning factor", value=1, minimum=0, maximum=1, step=0.01
                         )
-                    '''controlnet_scale = gr.Slider(
-                            label="Controlnet scale", value=1, minimum=0, maximum=2, step=0.01
-                        )'''
                     with gr.Row():
                         adapter_img = gr.Image(
                             image_mode="RGB",
@@ -2636,12 +2647,11 @@ with gr.Blocks(css=css) as demo:
                     queue=False,
                 )
 
-
     gr.HTML(
         f"""
             <div class="finetuned-diffusion-div">
               <div>
-                <h1>Spatial Control </h1>
+                <h1>Spatial Control</h1>
               </div>
               <p>
                 Define the object's region.
@@ -2684,7 +2694,6 @@ with gr.Blocks(css=css) as demo:
                     sk_update = gr.Button(value="Update").style(
                         rounded=(False, True, True, False)
                     )
-
 
             with gr.Tab("SketchPad"):
 
@@ -2914,6 +2923,7 @@ with gr.Blocks(css=css) as demo:
         ip_adapter_multi,
         guidance_rescale,
         inf_control_adapt_image,
+        long_encode,
     ]
     outputs = [image_out,gallery]
     prompt.submit(inference, inputs=inputs, outputs=outputs)
