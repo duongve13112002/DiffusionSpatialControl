@@ -319,9 +319,6 @@ unet_cache = {
     base_model: unet
 }
 
-lora_cache = {
-    base_model: LoRANetwork(text_encoder, unet)
-}
 tokenizer_cache ={
     base_model: tokenizer
 }
