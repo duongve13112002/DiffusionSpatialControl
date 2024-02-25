@@ -2244,7 +2244,7 @@ with gr.Blocks(css=css) as demo:
                             label="IP-Adapter", source="upload", type="pil"
                         )
                         inf_control_adapt_image = gr.Image(
-                            label="Region apply", source="upload", type="pil",image_mode='L'
+                            label="Region apply(Black masks are the regions you want to apply)", source="upload", type="pil",image_mode='L'
                         )
                         inf_adapt_image_multi = gr.Image(
                             label="IP-Adapter", source="upload", type="pil",visible= False
