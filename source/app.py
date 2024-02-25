@@ -46,7 +46,6 @@ from PIL import Image,ImageOps
 from pathlib import Path
 from safetensors.torch import load_file
 import modules.safe as _
-from modules.lora import LoRANetwork
 import os
 import cv2
 from controlnet_aux import PidiNetDetector, HEDdetector,LineartAnimeDetector,LineartDetector,MLSDdetector,OpenposeDetector,MidasDetector,NormalBaeDetector,ContentShuffleDetector,ZoeDetector
