@@ -87,7 +87,7 @@ For each prompt, the results utilized the same configurations and a region map. 
 #### Comparing with IP-Adapter attention masking
 
 ![Compare_method](Figure/compare_ipadapter_mask.svg)
-> All generated images are used in the same configuration, except for the IPAdapter scale, a unique seed, and the same dimensions of 768x512. The object's region image describes the character's position in the picture. It can be observed that our method performs better than IPAdapter attention masking.
+> All generated images are used in the same configuration, except for the IPAdapter scale, a unique seed, and the same dimensions of 768x512. The object's region image describes the character's position in the picture. It can be observed that our method performs better than IPAdapter attention masking. "Regular" means that the images are generated in a normal way without applying masks to the objects.
 
 #### IP-Adapter + ControlNet
 ![IP_adapter_control_net](Figure/Result_on_ipadapter_controlnet.png)
