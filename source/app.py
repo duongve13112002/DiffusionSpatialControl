@@ -2111,9 +2111,9 @@ with gr.Blocks(css=css) as demo:
                 with gr.Group():
 
                     with gr.Row():
-                        diffuser_pipeline = gr.Checkbox(label="Using diffusers pipeline", value=False)
+                        diffuser_pipeline = gr.Checkbox(label="Using diffusers samplers", value=False)
                         latent_processing = gr.Checkbox(label="Show processing", value=False)
-                        region_condition = gr.Checkbox(label="Enable region condition", value=False)
+                        region_condition = gr.Checkbox(label="Enable Spatial Control", value=False)
                     with gr.Row():
                         guidance = gr.Slider(
                             label="Guidance scale", value=7.5, maximum=20
