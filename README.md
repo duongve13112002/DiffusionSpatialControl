@@ -84,6 +84,11 @@ For each prompt, the results utilized the same configurations and a region map. 
 ![IP_adapter](Figure/Result_on_ipadapter.png)
 > In this figure, for each distinct prompt, we present four results. Results within the same column represent images generated with the same random seed, and within the same row, the same input is utilized. The first row showcases outcomes without utilizing a region map, while the second row employs a region map. The results have the same resolution of 768x512.
 
+#### Comparing with IP-Adapter attention masking
+
+![Compare_method](Figure/compare_ipadapter_mask.svg)
+> All generated images are used in the same configuration, except for the IPAdapter scale, a unique seed, and the same dimensions of 768x512. The object's region image describes the character's position in the picture. It can be observed that our method performs better than IPAdapter attention masking.
+
 #### IP-Adapter + ControlNet
 ![IP_adapter_control_net](Figure/Result_on_ipadapter_controlnet.png)
 
