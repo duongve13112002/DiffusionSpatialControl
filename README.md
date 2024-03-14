@@ -8,7 +8,7 @@ Recent advancements in diffusion models have demonstrated remarkable outcomes in
 - [Overview](#overview)
 - [Features](#features)
 - [Method](#method)
-- [Result](#result)
+- [Experiments](#experiments)
 - [Conclusion](#conclusion)
 - [Installation](#installation)
 - [Usage](#usage)
@@ -68,7 +68,7 @@ For each prompt, the results utilized the same configurations and a region map. 
 ### Quantitative Evaluation
 - To ensure fairness, we ran them on identical hardware using the "QuinceMix v2.0" model, which is structurally similar to Stable Diffusion v1.5 with specific hyperparameters: negative prompt ("bad quality, low quality, jpeg artifact, cropped"), clip skip = 2, guidance scale = 7.5, and the consistent generated image size of 512x512. All methods used the same seeds and the [DPM++ 2M Karras sampler](https://github.com/crowsonkb/k-diffusion) with 25 sampling steps for the reverse diffusion process.
 
-- To ensure optimal performance, we adopted the hyperparameters from the respective papers for [MultiDiffusion](https://github.com/omerbt/MultiDiffusion) and [Masked-Attention Guidance](https://github.com/endo-yuki-t/MAG) methods. For MultiDiffusion, we used bootstrapping with a 20% value for denoising steps. Masked-Attention Guidance's guidance scale ($\alpha$) and loss weight ($\lambda$) were set to 0.08 and 0.5, respectively. We customized $S$ and didn't use $S'$ in our method , as indicated in the region maps. Our evaluation process involved randomly selecting seeds for each prompt and region map, and the methods generated images across all these selected seeds. The assessment results adhered to three criteria:
+- To ensure optimal performance, we adopted the hyperparameters from the respective papers for [MultiDiffusion](https://github.com/omerbt/MultiDiffusion) and [Masked-Attention Guidance](https://github.com/endo-yuki-t/MAG) methods. For [MultiDiffusion](https://github.com/omerbt/MultiDiffusion), we used bootstrapping with a 20% value for denoising steps. [Masked-Attention Guidance's](https://github.com/endo-yuki-t/MAG) guidance scale ($\alpha$) and loss weight ($\lambda$) were set to 0.08 and 0.5, respectively. We customized $S$ and didn't use $S'$ in our method , as indicated in the region maps. Our evaluation process involved randomly selecting seeds for each prompt and region map, and the methods generated images across all these selected seeds. The assessment results adhered to three criteria:
 	- **Region Map Compliance:** Evaluates the faithfulness of generated objects to the predefined region. Higher scores indicate better alignment with the specified region, a crucial criterion.
 	- **Prompt Compliance:** Evaluates how well the generated image includes all objects from the prompt, with a higher score indicating better adherence to the prompt.
 	- **Secondary Criterion:** Awards additional points for aesthetically pleasing and high-quality generated images, serving as a supplementary evaluation criterion.
