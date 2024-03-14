@@ -31,22 +31,21 @@ Developing and implementing method with [the Hugging Face Diffusers library](htt
 
 The user provides a text prompt $p$, and a region map $R$. Additionally, the user specifies correspondences $O$ between words in a text prompt, region masks in $R$, and strength relationships $S$. We define ~$O = {\(O_i\)_{i=1}^{N}}$~, with ~$O_i$~ being the word the user wants to control, and ~$N$~ is the number of objects. The region map ~$R$~ is defined as ~$R = \{R_{O_i}\}$~, with ~$R_{O_i}$~ corresponding to the region mask associated with word $O_i$. The strength relationships are described by $S = \{S_{O_i}\}$, with $S_{O_i}$ showing the level of $O_i$ situated within region $R_{O_i}$. Moreover, there is an optional hyperparameter,  $S' = \{S'_{O_i}\}$, which is utilized to reduce the correlation between unmarked regions with $O_i$.
 
-![Cross-attention_before](Figure/User_input_hyper.png)
-> The results were obtained with different strength level $S$ and $S'$ values for the "1girl," with the strength level $S$ and $S'$ of the "sun" set to a constant value of 0.5 and 0.
+![Cross-attention_before](Figure/image_readme/user_input.svg)
+> The results were obtained with different $S$ and $S'$ values for the "1girl", with $S$ and $S'$ of the "sun" set to a constant value of 0.5 and 0.
 
-The selection of hyperparameters in this method is crucial. As seen from [Figure](Figure/User_input_hyper.png), all images were generated using the same configuration and on a device. Choosing suitable values for $S$ is essential; when each $S_{O_i}$ in $S$ is chosen appropriately, the generated images will meet the desired positions. However, if these hyperparameters do not meet the criteria, the resulting images may not align with your expectations. Furthermore, the careful selection of hyperparameters not only aids in generating images with specified words but also contributes to the aesthetic quality of the images. $S'$ plays a supportive role in enhancing the attention of the cross-attention map to the desired word in the specified region
+The method's hyperparameter selection is crucial. In [Figure](Figure/image_readme/user_input.svg), images were generated with the same seed, using a guidance scale of 7.5, [DPM++ 2M Karras sampler](https://github.com/crowsonkb/k-diffusion) with 25 steps, all on the same device. Proper values for $S$ are vital; appropriately choosing each $S_{O_i}$ ensures images align with desired positions. Incorrect hyperparameters may lead to unexpected results. Careful selection not only aids in generating images with specified words but also enhances aesthetic quality. $S'$ supports the cross-attention map's focus on the desired word in the region. In [Figure](Figure/image_readme/user_input.svg), adjusting $S'$ affected only $S = 0.4$ for misplaced instances, while for others, it altered picture features. Modifying $S'$ can enhance overall image composition for more aesthetically pleasing results.
 
 ### Workflow
 
-![Process](Figure/process/Process.svg)
-> Illustration of the method's process. The user has the ability to manipulate the placement of objects by choosing specific phrases, such as "lovely anime girl" and "bridge," and applying them to the canvas. The designated masks provided by the user contribute to elevating the significance of the respective phrases in the attention matrix within the cross-attention layers.
+![Process](Figure/image_readme/process/Process.svg)
+> Visualizing the method's process. Users manipulate object placement by choosing phrases like 'A girl' and 'bridge'. User-designated masks enhance the importance of these phrases in the attention matrix within cross-attention layers.
 
-The cross-attention maps of a Stable Diffusion by using [DAAM](https://github.com/castorini/daam/) with the prompt "A **lovely anime girl** sitting on a **bridge**." and chosing 2 pharses "lovely anime girl" and "bridge"
-> Without using method
-![Cross-attention_before](Figure/process/process_before.png)
-> Using method
-![Cross-attention_after](Figure/process/process_after.png)
-> The highlighted pixels in heatmaps show stronger associations with each word, showcasing the network’s focus on distinct pixels for individual words.
+The cross-attention maps of a Stable Diffusion by using [DAAM](https://github.com/castorini/daam/) with the prompt "**A girl** sitting on the **bridge**." and chosing 2 pharses "A girl" and "bridge"
+
+
+![Cross-attention_before](Figure/image_readme/process/cross_attention_map.svg)
+> Visualizing cross-attention maps for Stable Diffusion with [DAAM](https://github.com/castorini/daam/). The top row depicts the scenario without our method, while the bottom row demonstrates its impact. Highlighted pixels in heatmaps show stronger relationships with each word, showcasing the network's focus on distinct pixels for individual words.
 
 Through experimentation, we observed that using a scale $\beta$ at high noise levels and making the influence of A irrelevant to the scale of Q and K results in a more pronounced emphasis on the object’s region.
 
@@ -62,35 +61,51 @@ where:
 
    - $a$ is the outcome of the computational process involving Q, K, and the attention mask, as expressed by the formula $a$ = $Q\cdot K^{T} + M$.
 
-## Result
+## Experiments
 For each prompt, the results utilized the same configurations and a region map. The region map is a map that illustrates the areas of instances, and on these region maps, we also attached the hyperparameters used to generate that image. Furthermore, for each prompt, we generated images without using the region map and with multiple seed usage. Our method, when using Stable Diffusion took 5 seconds to generate an image, whereas without it, the process took 4.6 seconds on a computer with 1 NVIDIA T4 GPU.
 
-![Various_model](Figure/Result_on_various_model.png)
+
+### Quantitative Evaluation
+- To ensure fairness, we ran them on identical hardware using the "QuinceMix v2.0" model, which is structurally similar to Stable Diffusion v1.5 with specific hyperparameters: negative prompt ("bad quality, low quality, jpeg artifact, cropped"), clip skip = 2, guidance scale = 7.5, and the consistent generated image size of 512x512. All methods used the same seeds and the [DPM++ 2M Karras sampler](https://github.com/crowsonkb/k-diffusion) with 25 sampling steps for the reverse diffusion process.
+
+- To ensure optimal performance, we adopted the hyperparameters from the respective papers for [MultiDiffusion](https://github.com/omerbt/MultiDiffusion) and [Masked-Attention Guidance](https://github.com/endo-yuki-t/MAG) methods. For MultiDiffusion, we used bootstrapping with a 20% value for denoising steps. Masked-Attention Guidance's guidance scale ($\alpha$) and loss weight ($\lambda$) were set to 0.08 and 0.5, respectively. We customized $S$ and didn't use $S'$ in our method , as indicated in the region maps. Our evaluation process involved randomly selecting seeds for each prompt and region map, and the methods generated images across all these selected seeds. The assessment results adhered to three criteria:
+	- **Region Map Compliance:** Evaluates the faithfulness of generated objects to the predefined region. Higher scores indicate better alignment with the specified region, a crucial criterion.
+	- **Prompt Compliance:** Evaluates how well the generated image includes all objects from the prompt, with a higher score indicating better adherence to the prompt.
+	- **Secondary Criterion:** Awards additional points for aesthetically pleasing and high-quality generated images, serving as a supplementary evaluation criterion.
+- By considering these three criteria, our evaluation aims to provide a comprehensive and nuanced perspective on the performance of the methods under various conditions.
+
+![Evalution_Methods.svg](Figure/image_readme/evalution_methods.svg)
+> Illustrate the generated images for each method with each pair of prompt and a region map, where the methods' results on the left represent the least satisfying criteria and on the right represent the most satisfying criteria.
+
+- Relying solely on these two cases for conclusions may be misleading; thus, we provide the generated images at [here](Figure/source/quantitative_evaluation/) for a comprehensive individual evaluation.
+
+###Expanding Evaluation
+![Various_model](Figure/image_readme/Result_on_various_model.svg)
 > The different diffusion models' generated images from each prompt using the same configurations and seed with our method.
 
-![large_image](Figure/large_image.png)
+![large_image](Figure/image_readme/large_image.png)
 > The effectiveness of image generation using the proposed method contributes to Stable Diffusion's ability to avoid prompt manipulation. All generated images are executed at a consistent size of 1920x1088.
 
-### Integration with Control Methods
+### Integration with Controllable Tools
 
 #### ControlNet
-![Control_net](Figure/Result_on_controlnet.png)
+![Control_net](Figure/image_readme/Result_on_controlnet.png)
 > With a general description prompt, by combining ControlNet and our methodology, images tailored to the users' needs can be created.
 
-![Multi_control_net](Figure/Result_on_multicontrolnet.png)
+![Multi_control_net](Figure/image_readme/Result_on_multicontrolnet.png)
 > Notice without method a lot of intances are missing.
 
 #### IP-Adapter
-![IP_adapter](Figure/Result_on_ipadapter.png)
+![IP_adapter](Figure/image_readme/Result_on_ipadapter.png)
 > In this figure, for each distinct prompt, we present four results. Results within the same column represent images generated with the same random seed, and within the same row, the same input is utilized. The first row showcases outcomes without utilizing a region map, while the second row employs a region map. The results have the same resolution of 768x512.
 
 #### Comparing with IP-Adapter attention masking
 
-![Compare_method](Figure/compare_ipadapter_mask.svg)
+![Compare_method](Figure/image_readme/compare_ipadapter_mask.svg)
 > All generated images are used in the same configuration, except for the IPAdapter scale, a unique seed, and the same dimensions of 768x512. The object's region image describes the character's position in the picture. It can be observed that our method performs better than IPAdapter attention masking. "Regular" means that the images are generated in a normal way without applying masks to the objects.
 
 #### IP-Adapter + ControlNet
-![IP_adapter_control_net](Figure/Result_on_ipadapter_controlnet.png)
+![IP_adapter_control_net](Figure/image_readme/Result_on_ipadapter_controlnet.png)
 
 ## Conclusion
 
