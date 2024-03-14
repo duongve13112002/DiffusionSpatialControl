@@ -38,7 +38,7 @@ The method's hyperparameter selection is crucial. In [Figure](Figure/image_readm
 
 ### Workflow
 
-![Process](Figure/image_readme/process/Process.svg)
+![Process](Figure/image_readme/process/process.svg)
 > Visualizing the method's process. Users manipulate object placement by choosing phrases like 'A girl' and 'bridge'. User-designated masks enhance the importance of these phrases in the attention matrix within cross-attention layers.
 
 The cross-attention maps of a Stable Diffusion by using [DAAM](https://github.com/castorini/daam/) with the prompt "**A girl** sitting on the **bridge**." and chosing 2 pharses "A girl" and "bridge"
@@ -79,25 +79,25 @@ For each prompt, the results utilized the same configurations and a region map. 
 
 - Relying solely on these two cases for conclusions may be misleading; thus, we provide the generated images at [here](Figure/source/quantitative_evaluation/) for a comprehensive individual evaluation.
 
-###Expanding Evaluation
+### Expanding Evaluation
 ![Various_model](Figure/image_readme/Result_on_various_model.svg)
-> The different diffusion models' generated images from each prompt using the same configurations and seed with our method.
+> The different diffusion models' generated images from each prompt using the same configurations and seed with our proposed method. All generated images have the same resolution of 512x512.
 
 ![large_image](Figure/image_readme/large_image.png)
-> The effectiveness of image generation using the proposed method contributes to Stable Diffusion's ability to avoid prompt manipulation. All generated images are executed at a consistent size of 1920x1088.
+> The proposed method enhances Stable Diffusion's ability to prevent prompt manipulation in image generation. Columns show results with the same seed, and rows depict results with and without a Region map, all at a consistent size of 1920x1088.
 
 ### Integration with Controllable Tools
 
 #### ControlNet
 ![Control_net](Figure/image_readme/Result_on_controlnet.png)
-> With a general description prompt, by combining ControlNet and our methodology, images tailored to the users' needs can be created.
+> With a general description prompt, by combining ControlNet and our methodology, images tailored to the users' needs can be created. Columns show results with the same seed, while rows illustrate results with and without a Region map.
 
 ![Multi_control_net](Figure/image_readme/Result_on_multicontrolnet.png)
 > Notice without method a lot of intances are missing.
 
 #### IP-Adapter
 ![IP_adapter](Figure/image_readme/Result_on_ipadapter.png)
-> In this figure, for each distinct prompt, we present four results. Results within the same column represent images generated with the same random seed, and within the same row, the same input is utilized. The first row showcases outcomes without utilizing a region map, while the second row employs a region map. The results have the same resolution of 768x512.
+> Visualization of images generated with IP-Adapter, combining region maps and prompts. Each column shows results with the same seed and the same input in each row. The first row shows results without a region map, and the second row uses a region map. All results have the same resolution of 768x512.
 
 #### Comparing with IP-Adapter attention masking
 
