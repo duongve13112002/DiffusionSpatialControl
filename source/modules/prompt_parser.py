@@ -4,8 +4,7 @@ import math
 import numpy as np
 import torch
 
-# Code from https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/8e2aeee4a127b295bfc880800e4a312e0f049b85, modified.
-
+# Code from https://github.com/AUTOMATIC1111/stable-diffusion-webui/blob/master/modules/sd_hijack_clip.py, modified.
 class PromptChunk:
     """
     This object contains token ids, weight (multipliers:1.4) and textual inversion embedding info for a chunk of prompt.

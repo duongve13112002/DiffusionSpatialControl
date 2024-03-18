@@ -36,13 +36,15 @@ from modules.model_diffusers import (
     StableDiffusionPipeline_finetune,
     StableDiffusionControlNetPipeline_finetune,
     StableDiffusionControlNetImg2ImgPipeline_finetune,
-    StableDiffusionImg2ImgPipeline_finetune
+    StableDiffusionImg2ImgPipeline_finetune,
+    StableDiffusionInpaintPipeline_finetune,
+    StableDiffusionControlNetInpaintPipeline_finetune,
 )
 from modules.attention_modify import AttnProcessor,IPAdapterAttnProcessor,AttnProcessor2_0,IPAdapterAttnProcessor2_0
 from modules.model_k_diffusion import StableDiffusionPipeline
 from torchvision import transforms
 from transformers import CLIPTokenizer, CLIPTextModel,CLIPImageProcessor
-from PIL import Image,ImageOps
+from PIL import Image,ImageOps, ImageChops
 from pathlib import Path
 from safetensors.torch import load_file
 import modules.safe as _
@@ -56,27 +58,27 @@ import copy
 from modules.preprocessing_segmentation import preprocessing_segmentation
 import torch.nn.functional as F
 from modules.t2i_adapter import setup_model_t2i_adapter
-from modules.ip_adapter_processor import IPAdapterMaskProcessor
+from diffusers.image_processor import IPAdapterMaskProcessor
 from typing import Callable, Dict, List, Optional, Union
+from insightface.app import FaceAnalysis
+from diffusers.utils import load_image
+
 embeddings_dict = dict()
 lora_dict = {'Not using Lora':None,}
 lora_lst = ['Not using Lora']
-formula = [
-    ['w = token_weight_martix * sigma * std(qk)',0],
-]
 
 encoding_type ={
     "Automatic111 Encoding": 0,
     "Long Prompt Encoding": 1,
     "Short Prompt Encoding": 2,
 }
-model_ip_adapter_lst = ['IP-Adapter','IP-Adapter VIT-G','IP-Adapter Light','IP-Adapter Face','IP-Adapter Plus','IP-Adapter Plus Face']
+model_ip_adapter_lst = ['IP-Adapter','IP-Adapter Light','IP-Adapter Face','IP-Adapter FaceID','IP-Adapter Plus','IP-Adapter Plus Face']
 
 model_ip_adapter_type = {
     "IP-Adapter": "ip-adapter_sd15.bin",
-    "IP-Adapter VIT-G": "ip-adapter_sd15_vit-G.bin",
     "IP-Adapter Light": "ip-adapter_sd15_light.bin",
     "IP-Adapter Face":"ip-adapter-full-face_sd15.bin",
+    "IP-Adapter FaceID":"ip-adapter-faceid_sd15.bin",
     "IP-Adapter Plus": "ip-adapter-plus_sd15.bin",
     "IP-Adapter Plus Face": "ip-adapter-plus-face_sd15.bin",
 }
@@ -224,7 +226,6 @@ samplers_k_diffusion = [
     ('Restart Polyexponential', samplers_extra_k_diffusion.restart_sampler, {'scheduler': 'polyexponential', "second_order": True}),
 ]
 
-
 samplers_diffusers = [
     ('Euler a', lambda ddim_scheduler_config: EulerAncestralDiscreteScheduler.from_config(ddim_scheduler_config), {}),
     ('Euler', lambda ddim_scheduler_config: EulerDiscreteScheduler.from_config(ddim_scheduler_config), {}),
@@ -263,14 +264,16 @@ scheduler = DDIMScheduler.from_pretrained(
     base_model,
     subfolder="scheduler",
 )
+
+
 vae = AutoencoderKL.from_pretrained(base_model,
     subfolder="vae",
-    torch_dtype=torch.float16
+    torch_dtype=torch.float16,
 )
 if vae is None:
     vae = AutoencoderKL.from_pretrained(
         "stabilityai/sd-vae-ft-mse", 
-        torch_dtype=torch.float16
+        torch_dtype=torch.float16,
     )
 text_encoder = CLIPTextModel.from_pretrained(
     base_model,
@@ -319,6 +322,7 @@ unet_cache = {
     base_model: unet
 }
 
+
 tokenizer_cache ={
     base_model: tokenizer
 }
@@ -351,7 +355,7 @@ def setup_adapter(adapter_sp,device):
 
 
 
-def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipeline = False ,control_net_model = None,img_input = None,device = "cpu"):
+def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipeline = False ,control_net_model = None,img_input = None,device = "cpu",mask_inpaiting = None):
     global current_model
 
     keys = [k[0] for k in models]
@@ -372,6 +376,7 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
         vae_cache[model] = vae_model
         tokenizer_cache[model] = tokenizer
         feature_cache[model] = feature_extract
+
     if current_model != model:
         unet_cache[current_model].to(device)
         te_cache[current_model].to(device)
@@ -387,7 +392,19 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
     
     if diffuser_pipeline:
         if control_net_model is not None:
-            if img_input is not None:
+            if mask_inpaiting and img_input:
+                pipe = StableDiffusionControlNetInpaintPipeline_finetune(
+                    vae= local_vae,
+                    text_encoder= local_te,
+                    tokenizer=local_token,
+                    unet=local_unet,
+                    controlnet = control_net_model,
+                    safety_checker= None,
+                    scheduler = local_sche,
+                    feature_extractor=local_feature,
+                    requires_safety_checker = False,
+                ).to(device)
+            elif img_input is not None:
                 pipe = StableDiffusionControlNetImg2ImgPipeline_finetune(
                     vae= local_vae,
                     text_encoder= local_te,
@@ -412,7 +429,18 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
                     requires_safety_checker = False,
                 ).to(device)
         else:
-            if img_input is not None:
+            if mask_inpaiting and img_input:
+                pipe = StableDiffusionInpaintPipeline_finetune(
+                    vae= local_vae,
+                    text_encoder= local_te,
+                    tokenizer=local_token,
+                    unet=local_unet,
+                    scheduler = local_sche,
+                    safety_checker= None,
+                    feature_extractor=local_feature,
+                    requires_safety_checker = False,
+                ).to(device)
+            elif img_input is not None:
                 pipe = StableDiffusionImg2ImgPipeline_finetune(
                     vae= local_vae,
                     text_encoder= local_te,
@@ -434,7 +462,7 @@ def setup_model(name,clip_skip, lora_state=None, lora_scale=1.0,diffuser_pipelin
                     feature_extractor=local_feature,
                     requires_safety_checker = False,
                 ).to(device)
-    else:        
+    else:     
         pipe = StableDiffusionPipeline(
             text_encoder=local_te,
             tokenizer=local_token,
@@ -705,7 +733,6 @@ def control_net_preprocessing(control_net_model,img_control,low_threshold = None
     elif control_net_model == 'MLSD':
         processor = MLSDdetector.from_pretrained("lllyasviel/ControlNet").to(device)
         img_control = processor(img_control)
-        #img_control = np.array(img_control)
     elif control_net_model == 'Semantic Segmentation':
         img_control = preprocessing_segmentation(preprocessor_name,img_control)
     elif control_net_model == 'Normal Map':
@@ -757,16 +784,46 @@ def add_embedding(pipe_model,embs):
     gc.collect()
     return pipe_model
 
-def mask_region_apply_ip_adapter(mask):
+def mask_region_apply_ip_adapter(mask,invert_ip_adapter_mask_mode):
     if mask is None:
         return None
-    #define black is region masked
     if not isinstance(mask,List):
         mask = [mask]
-    mask = [ImageOps.invert(i).convert('RGB') for i in mask]
+    if len(mask) == 0:
+        return None
+    if invert_ip_adapter_mask_mode:
+        mask = [ImageOps.invert(i).convert('RGB') for i in mask]
     processor = IPAdapterMaskProcessor()
     masks = processor.preprocess(mask)
     return masks
+
+def ip_adapter_face_id_embedding(lst_img_face_id_embed,device,dtype,guidance_scale):
+    ref_images_embeds = []
+    ref_unc_images_embeds = []
+    app = FaceAnalysis(name="buffalo_l", providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+    app.prepare(ctx_id=0, det_size=(640, 640))
+    if not isinstance(lst_img_face_id_embed,list):
+        lst_img_face_id_embed = [lst_img_face_id_embed]
+    for im in lst_img_face_id_embed:
+        image = cv2.cvtColor(np.asarray(im), cv2.COLOR_BGR2RGB)
+        faces = app.get(image) #faces is a list
+        if len(faces) == 0:
+            raise ValueError(
+                "Can not find any faces in the image."
+            )
+        image = torch.from_numpy(faces[0].normed_embedding)
+        image_embeds = image.unsqueeze(0)
+        uncond_image_embeds = torch.zeros_like(image_embeds)
+        ref_images_embeds.append(image_embeds)
+        ref_unc_images_embeds.append(uncond_image_embeds)
+    ref_images_embeds = torch.stack(ref_images_embeds, dim=0)
+    if guidance_scale > 1 :
+        ref_unc_images_embeds = torch.stack(ref_unc_images_embeds, dim=0)
+        single_image_embeds = torch.cat([ref_unc_images_embeds, ref_images_embeds], dim=0).to(device,dtype=dtype)
+    else:
+        single_image_embeds = ref_images_embeds.to(device,dtype=dtype)
+    return single_image_embeds
+
 
 lst_control = []
 lst_adapter =[]
@@ -795,7 +852,6 @@ def inference(
     model=None,
     lora_state=None,
     lora_scale=None,
-    formula_setting = None,
     controlnet_enabled = False,
     control_net_model = None,
     low_threshold = None,
@@ -839,6 +895,11 @@ def inference(
     guidance_rescale = 0,
     inf_control_adapt_image = None,
     long_encode = 0,
+    inpaiting_mode = False,
+    invert_mask_mode = False,
+    mask_upload = None,
+    inf_image_inpaiting = None,
+    invert_ip_adapter_mask_mode = True,
 ):
     global formula,controlnet_type,lst_control,lst_adapter,model_ip_adapter_type,adapter_type,lst_ip_adapter,current_number_ip_adapter,encoding_type
     img_control_input = None
@@ -848,6 +909,18 @@ def inference(
     if region_condition == False:
         state = None
 
+    mask_inpaiting = None
+    if inpaiting_mode and isinstance(inf_image_inpaiting,dict):
+        mask_inpaiting =  inf_image_inpaiting["mask"]
+        img_input = inf_image_inpaiting["image"]
+        diff = ImageChops.difference(mask_inpaiting, img_input)
+        if diff.getbbox() is None:
+            mask_inpaiting = None
+    if inpaiting_mode and mask_upload:
+        mask_inpaiting = mask_upload
+    if mask_inpaiting and invert_mask_mode:
+        mask_inpaiting = ImageOps.invert(mask_inpaiting).convert('RGB')
+    
     if adapter_enabled:
         if len(lst_adapter) > 0 and multi_adapter:
             adapter_img = []
@@ -922,17 +995,13 @@ def inference(
     else:
         control_net_model = None 
         img_control = None
-    keys_f = [k[0] for k in formula]
-    formula_setting = formula[keys_f.index(formula_setting)][1]
     if seed is None or seed < 0:
         seed = random.randint(0, sys.maxsize)
 
     lora_state = lora_dict[lora_state]
-    pipe = setup_model(model,clip_skip, lora_state, lora_scale,diffuser_pipeline,control_net_model,img_input,device)
+    pipe = setup_model(model,clip_skip, lora_state, lora_scale,diffuser_pipeline,control_net_model,img_input,device,mask_inpaiting)
     generator = torch.Generator(device).manual_seed(int(seed))
-    
     weight_func = lambda w, sigma, qk: w * sigma * qk.std()
-
     start_time = time.time()
 
     sampler_name, sampler_opt = None, None
@@ -947,6 +1016,7 @@ def inference(
 
     #Get type encoding
     long_encode = encoding_type[long_encode]
+    ip_adapter_image_embeds = None
 
     if ip_adapter == True:
         if ip_adapter_multi and len(lst_ip_adapter) > 0:
@@ -954,23 +1024,72 @@ def inference(
             model_ip_adapter_lst = []
             scale_ip_adapter_lst = []
             region_aplly_lst = []
+
+            ip_adapter_faceid_image_lst =[]
+            model_ip_adapter_faceid_lst = []
+            scale_ip_adapter_faceid_lst = []
+            region_aplly_lst_faceid = []
+
             for i in lst_ip_adapter:
-                ip_adapter_image_lst.append(i["image"])
-                model_ip_adapter_lst.append(model_ip_adapter_type[i["model"]])
-                scale_ip_adapter_lst.append(float(i["scale"]))
-                if i["region_apply"] is not None:
-                    region_aplly_lst.append(i["region_apply"])
-            if len(region_aplly_lst) == 0:
-                region_aplly_lst = None
-            inf_adapt_image = ip_adapter_image_lst
-            pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name=model_ip_adapter_lst)
+                if 'FaceID' not in i["model"]:
+                    ip_adapter_image_lst.append(i["image"])
+                    model_ip_adapter_lst.append(model_ip_adapter_type[i["model"]])
+                    scale_ip_adapter_lst.append(float(i["scale"]))
+                    if i["region_apply"] is not None:
+                        region_aplly_lst.append(i["region_apply"])
+                else:
+                    ip_adapter_faceid_image_lst.append(i["image"])
+                    model_ip_adapter_faceid_lst.append(model_ip_adapter_type[i["model"]])
+                    scale_ip_adapter_faceid_lst.append(float(i["scale"]))
+                    if i["region_apply"] is not None:
+                        region_aplly_lst_faceid.append(i["region_apply"])
+
+            #Concat faceid and ipadapter
+            only_face_id = 0
+            if len(model_ip_adapter_lst) == 0:
+                only_face_id = 1
+
+            if len(ip_adapter_faceid_image_lst) > 0:
+                pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name=model_ip_adapter_lst)
+                pipe.set_ip_adapter_scale(scale_ip_adapter_lst)
+                ip_adapter_image_embeds = pipe.prepare_ip_adapter_image_embeds(ip_adapter_image_lst,None,device,1, guidance>1) + [ip_adapter_face_id_embedding(ip_adapter_faceid_image_lst,device,pipe.unet.dtype,guidance)]
+                inf_adapt_image = None
+                if not isinstance(ip_adapter_image_embeds, list):
+                    ip_adapter_image_embeds = [ip_adapter_image_embeds]
+                pipe.unload_ip_adapter()
+            else:
+                inf_adapt_image = ip_adapter_image_lst
+                ip_adapter_image_embeds = None
+
+            region_aplly_lst = region_aplly_lst + region_aplly_lst_faceid
+            load_model = ["h94/IP-Adapter"]*len(model_ip_adapter_lst) + ["h94/IP-Adapter-FaceID"]*len(model_ip_adapter_faceid_lst)
+            subfolder = ["models"]*len(model_ip_adapter_lst) + [None]*len(model_ip_adapter_faceid_lst)
+            model_ip_adapter_lst = model_ip_adapter_lst + model_ip_adapter_faceid_lst
+            scale_ip_adapter_lst = scale_ip_adapter_lst + scale_ip_adapter_faceid_lst
+
+            if only_face_id:
+                pipe.load_ip_adapter(load_model, subfolder=subfolder, weight_name=model_ip_adapter_lst,image_encoder_folder=None)
+            else:
+                pipe.load_ip_adapter(load_model, subfolder=subfolder, weight_name=model_ip_adapter_lst)
             pipe.set_ip_adapter_scale(scale_ip_adapter_lst)
-            cross_attention_kwargs = {"ip_adapter_masks":mask_region_apply_ip_adapter(region_aplly_lst)}
+
+
+            cross_attention_kwargs = {"ip_adapter_masks":mask_region_apply_ip_adapter(region_aplly_lst,invert_ip_adapter_mask_mode)}
         elif inf_adapt_image is not None and ip_adapter_multi == False:
-            model_ip_adapter = model_ip_adapter_type[model_ip_adapter]
-            pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name=model_ip_adapter)
-            pipe.set_ip_adapter_scale(float(inf_adapt_image_strength))
-            cross_attention_kwargs = {"ip_adapter_masks":mask_region_apply_ip_adapter(inf_control_adapt_image)}
+            if 'FaceID' not in model_ip_adapter:
+                model_ip_adapter = model_ip_adapter_type[model_ip_adapter]
+                pipe.load_ip_adapter("h94/IP-Adapter", subfolder="models", weight_name=model_ip_adapter)
+                pipe.set_ip_adapter_scale(float(inf_adapt_image_strength))
+                cross_attention_kwargs = {"ip_adapter_masks":mask_region_apply_ip_adapter(inf_control_adapt_image,invert_ip_adapter_mask_mode)}
+            else:
+                model_ip_adapter = model_ip_adapter_type[model_ip_adapter]
+                pipe.load_ip_adapter("h94/IP-Adapter-FaceID", subfolder=None, weight_name=model_ip_adapter,image_encoder_folder=None)
+                pipe.set_ip_adapter_scale(float(inf_adapt_image_strength))
+                ip_adapter_image_embeds = ip_adapter_face_id_embedding([inf_adapt_image],device,pipe.unet.dtype,guidance)
+                if not isinstance(ip_adapter_image_embeds, list):
+                    ip_adapter_image_embeds = [ip_adapter_image_embeds]
+                cross_attention_kwargs = {"ip_adapter_masks":mask_region_apply_ip_adapter(inf_control_adapt_image,invert_ip_adapter_mask_mode)}
+                inf_adapt_image = None
         else:
             inf_adapt_image = None
     else:
@@ -1001,18 +1120,22 @@ def inference(
             "adapter_conditioning_factor":adapter_conditioning_factor,
             "guidance_rescale":guidance_rescale,
             "long_encode" : int(long_encode),
+            "ip_adapter_image_embeds": ip_adapter_image_embeds,
             "cross_attention_kwargs": cross_attention_kwargs
         }
         
-        if control_net_model is not None and img_input is not None:
+        if mask_inpaiting and img_input and inpaiting_mode and control_net_model:
+            result = pipe(mask_image = mask_inpaiting,width=img_input.width,height=img_input.height, controlnet_conditioning_scale = controlnet_scale,inf_adapt_image=inf_adapt_image,image =img_input , control_image=img_control,strength =  i2i_scale,control_guidance_start=control_guidance_start,control_guidance_end=control_guidance_end,**config)
+        elif control_net_model is not None and img_input is not None:
             result = pipe(controlnet_conditioning_scale = controlnet_scale,inf_adapt_image=inf_adapt_image,image =img_input , control_image=img_control,strength =  i2i_scale,control_guidance_start=control_guidance_start,control_guidance_end=control_guidance_end,**config)
+        elif control_net_model is not None:
+            result = pipe(width = width,height = height,controlnet_conditioning_scale = controlnet_scale, image=img_control,control_guidance_start=control_guidance_start,control_guidance_end=control_guidance_end,ip_adapter_image=inf_adapt_image,**config)
+        elif mask_inpaiting and img_input and inpaiting_mode:
+            result = pipe(image =img_input,ip_adapter_image=inf_adapt_image,mask_image = mask_inpaiting,strength=i2i_scale,width=img_input.width,height=img_input.height,**config)
+        elif img_input is not None:
+            result = pipe(image =img_input,strength =  i2i_scale,ip_adapter_image=inf_adapt_image,**config)
         else:
-            if control_net_model is not None:
-                result = pipe(width = width,height = height,controlnet_conditioning_scale = controlnet_scale, image=img_control,control_guidance_start=control_guidance_start,control_guidance_end=control_guidance_end,ip_adapter_image=inf_adapt_image,**config)
-            elif img_input is not None:
-                result = pipe(image =img_input,strength =  i2i_scale,ip_adapter_image=inf_adapt_image,**config)
-            else:
-                result = pipe(height = height, width = width,ip_adapter_image=inf_adapt_image,**config)            
+            result = pipe(height = height, width = width,ip_adapter_image=inf_adapt_image,**config)            
         if hr_enabled and img_input is None:
             del pipe
             torch.cuda.empty_cache()
@@ -1049,6 +1172,7 @@ def inference(
                 "adapter_conditioning_factor":adapter_conditioning_factor,
                 "guidance_rescale":guidance_rescale,
                 "long_encode" : int(long_encode),
+                "ip_adapter_image_embeds": ip_adapter_image_embeds,
                 "cross_attention_kwargs":cross_attention_kwargs,
             }
             if control_net_model is not None:
@@ -1089,10 +1213,13 @@ def inference(
             "guidance_rescale":guidance_rescale,
             'clip_skip' :int(clip_skip),
             "long_encode" : int(long_encode),
+            "ip_adapter_image_embeds": ip_adapter_image_embeds,
             "cross_attention_kwargs":cross_attention_kwargs,
         }
         pipe.setup_controlnet(control_net_model)
-        if img_input is not None:
+        if mask_inpaiting and img_input and inpaiting_mode:
+            result = pipe.inpaiting(prompt, image=img_input,mask_image = mask_inpaiting,strength=i2i_scale,width=img_input.width,height=img_input.height, **config)
+        elif img_input is not None:
             result = pipe.img2img(prompt, image=img_input, strength=i2i_scale,width=img_input.width,height=img_input.height, **config)
         elif hr_enabled:
             result = pipe.txt2img(
@@ -1150,8 +1277,11 @@ def create_mixed_img(current, state, w=512, h=512):
 
     return image_np
 
-def apply_size_sketch(width,height,state,inf_image):
-    if inf_image is not None:
+def apply_size_sketch(width,height,state,inf_image,inpaiting_mode,inf_image_inpaiting):
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height 
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1168,12 +1298,16 @@ def apply_size_sketch(width,height,state,inf_image):
 
 
 
-def detect_text(text, state, width, height,formula_button,inf_image):
+
+def detect_text(text, state, width, height,inf_image,inpaiting_mode,inf_image_inpaiting):
     global formula
     if text is None or text == "":
-        return None, None, gr.Radio.update(value=None,visible = False), None,gr.Dropdown.update(value = formula_button)
+        return None, None, gr.Radio.update(value=None,visible = False), None
 
-    if inf_image is not None:
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1203,42 +1337,8 @@ def detect_text(text, state, width, height,formula_button,inf_image):
     update = gr.Radio.update(choices=[key for key in new_state.keys()], value=None,visible = True)
     update_img = gr.update(value=create_mixed_img("", new_state, w_change, h_change))
     update_sketch = gr.update(value=None, interactive=False)
-    return new_state, update_sketch, update, update_img,gr.Dropdown.update(value = formula_button)
+    return new_state, update_sketch, update, update_img
 
-def detect_text1(text, state, width, height,formula_button,inf_image):
-    global formula
-    if text is None or text == "":
-        return None, None, gr.Radio.update(value=None,visible = False), None,gr.Dropdown.update(value = formula_button)
-
-    if inf_image is not None:
-        w_change = inf_image.width
-        h_change = inf_image.height 
-    else:
-        w_change = int(width)
-        h_change = int(height)
-
-    t = text.split(",")
-    new_state = {}
-
-    for item in t:
-        item = item.strip()
-        if item == "":
-            continue
-        if state is not None and item in state:
-            new_state[item] = {
-                "map": state[item]["map"],
-                "weight": state[item]["weight"],
-                "mask_outsides": state[item]["mask_outsides"],
-            }
-        else:
-            new_state[item] = {
-                "map": None,
-                "weight": 0.5,
-                "mask_outsides": False
-            }
-    update = gr.Radio.update(choices=[key for key in new_state.keys()], value=None,visible = True)
-    update_img = gr.update(value=create_mixed_img("", new_state, w_change, h_change))
-    return new_state, update, update_img,gr.Dropdown.update(value = formula_button)
 
 
 def resize(img, w, h):
@@ -1253,8 +1353,11 @@ def resize(img, w, h):
     return result
 
 
-def switch_canvas(entry, state, width, height,inf_image):
-    if inf_image is not None:
+def switch_canvas(entry, state, width, height,inf_image,inpaiting_mode,inf_image_inpaiting):
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1272,8 +1375,11 @@ def switch_canvas(entry, state, width, height,inf_image):
     )
 
 
-def apply_canvas(selected, draw, state, w, h,inf_image):
-    if inf_image is not None:
+def apply_canvas(selected, draw, state, w, h,inf_image,inpaiting_mode,inf_image_inpaiting):
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1376,8 +1482,11 @@ def extract_color_textboxes(color_map_image,MAX_NUM_COLORS):
 
 
 
-def apply_image_clustering(image, selected, w, h, strength, mask, state,inf_image):
-    if inf_image is not None:
+def apply_image_clustering(image, selected, w, h, strength, mask, state,inf_image,inpaiting_mode,inf_image_inpaiting):
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1393,9 +1502,11 @@ def apply_image_clustering(image, selected, w, h, strength, mask, state,inf_imag
     return state, gr.Image.update(value=create_mixed_img(selected, state, w_change, h_change))
 
 
-# sp2, radio, width, height, global_stats
-def apply_image(image, selected, w, h, strength, mask, state,inf_image):
-    if inf_image is not None:
+def apply_image(image, selected, w, h, strength, mask, state,inf_image,inpaiting_mode,inf_image_inpaiting):
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1428,10 +1539,12 @@ def apply_image(image, selected, w, h, strength, mask, state,inf_image):
                 "mask_outsides": mask
             }
     return state, gr.Image.update(value=create_mixed_img(selected, state, w_change, h_change))
-#rendered, apply_style, apply_clustering_style,Previous,Next,Completed,sp2,sp3
-def apply_base_on_color(sp2,state, width, height,inf_image):
+def apply_base_on_color(sp2,state, width, height,inf_image,inpaiting_mode,inf_image_inpaiting):
     global number_clustering,clustering_image
-    if inf_image is not None:
+    if inpaiting_mode and inf_image_inpaiting:
+        w_change = inf_image_inpaiting["image"].width
+        h_change = inf_image_inpaiting["image"].height
+    elif inf_image is not None:
         w_change = inf_image.width
         h_change = inf_image.height 
     else:
@@ -1464,7 +1577,6 @@ def next_image_page(sp3):
     if number_clustering >= len(clustering_image):
         number_clustering = 0
     return gr.Image.update(value = clustering_image[number_clustering])
-# [ti_state, lora_state, ti_vals, lora_vals, uploads]
 def add_net(files):
     if files is None:
         return gr.CheckboxGroup.update(choices=list(embeddings_dict.keys())),gr.Dropdown.update(choices=[k for k in lora_lst],value=lora_lst[0],),gr.File.update(value=None),
@@ -1480,18 +1592,15 @@ def add_net(files):
         else:
             state_dict = load_file(file.name, device="cpu")
         if any("lora" in k for k in state_dict.keys()):
-            #lora_state = file.name
             if stripedname not in lora_dict:
                 lora_lst.append(stripedname)
                 lora_dict[stripedname] = file.name 
         else:
-            #ti_state[stripedname] = file.name
             if stripedname not in embeddings_dict:
                 embeddings_dict[stripedname] = file.name 
     return gr.CheckboxGroup.update(choices=list(embeddings_dict.keys())),gr.Dropdown.update(choices=[k for k in lora_lst],value=lora_lst[0],),gr.File.update(value=None),
 
 
-# [ti_state, lora_state, ti_vals, lora_vals, uploads]
 def clean_states(ti_state):
     global lora_dict
     global embeddings_dict
@@ -1567,12 +1676,12 @@ def mode_diffuser_pipeline( controlnet_enabled):
         return gr.Checkbox.update(value = True),gr.Checkbox.update()
     return gr.Checkbox.update(value = False),gr.Checkbox.update(value = False)
 
+
 def res_cap(g, w, h, x):
     if g:
-        return f"Enable upscaler: {w}x{h} to {int(w*x)}x{int(h*x)}"
+        return f"Enable upscaler: {w}x{h} to {int(w*x)//8 *8}x{int(h*x)//8 *8}"
     else:
         return "Enable upscaler"
-#diffuser_pipeline,hr_enabled,sampler,gallery,controlnet_enabled
 def mode_upscale(diffuser_pipeline, hr_scale, width, height,hr_enabled):
     if hr_enabled == True:
         return gr.Checkbox.update(value = False),gr.Checkbox.update(value = True,label=res_cap(True, width, height, hr_scale)),gr.Dropdown.update(value="DPM++ 2M Karras",choices=[s[0] for s in samplers_k_diffusion]),gr.Checkbox.update(value = False)
@@ -1593,7 +1702,6 @@ def change_control_net(model_control_net, low_threshold, high_threshold,has_body
 
 previous_sampler = 'DPM++ 2M Karras'
 previous_sampler_hires = 'DPM++ 2M Karras'
-#sampler,gallery,hr_enabled,controlnet_enabled
 def mode_diffuser_pipeline_sampler(diffuser_pipeline, sampler,sampler_hires):
     global previous_sampler, previous_sampler_hires
     sample_now = previous_sampler
@@ -1647,7 +1755,6 @@ def change_image_condition(image_condition):
     return gr.Image.update(value= None)
 
 
-#control_net_model,img_control,low_threshold = None,high_threshold=None,has_hand=None,preprocessor_name=None
 def control_net_muti(control_net_model,img_control,low_threshold ,high_threshold,has_body,has_hand,has_face,preprocessor_name,controlnet_scale,control_guidance_start,control_guidance_end,disable_preprocessing):
     global lst_control
     if img_control is not None:
@@ -1773,7 +1880,6 @@ def change_image_condition_adapter(image_condition_adapter):
     return gr.Image.update(value= None)
 
 
-#control_net_model,img_control,low_threshold_adapter = None,high_threshold_adapter=None,has_hand=None,preprocessor_adapter=None
 def adapter_muti(model_adapter,img_control,low_threshold_adapter ,high_threshold_adapter,has_body,has_hand,has_face,preprocessor_adapter,adapter_conditioning_scale,adapter_conditioning_factor,disable_preprocessing_adapter):
     global lst_adapter
     if img_control is not None:
@@ -1862,7 +1968,6 @@ def ip_adpater_function(ip_adapter):
         return gr.Checkbox.update()
     return gr.Checkbox.update(value = False)
 
-#ip_adapter,inf_adapt_image,inf_adapt_image_multi,inf_adapt_image_strength,inf_adapt_image_strength_multi,edit_ip_adapter_setting,apply_ip_adapter_setting
 def ip_adpater_multi_function(ip_adapter_multi):
     if ip_adapter_multi:
         return gr.Checkbox.update(value = True), gr.Image.update(visible = False), gr.Image.update(visible = True), gr.Slider.update(visible = False), gr.Slider.update(visible = True),gr.Button.update(visible = True),gr.Button.update(visible = True), gr.Image.update(visible = False), gr.Image.update(visible = True)
@@ -1881,7 +1986,6 @@ def apply_ip_adapter_setting_function(model_ip_adapter,inf_adapt_image_multi,inf
         return gr.Image.update(value = None),gr.Image.update(value = None)
     return gr.Image.update(value = None),gr.Image.update(value = None)
 
-#model_ip_adapter,inf_adapt_image_multi,inf_adapt_image_strength_multi,previous_ip_adapter_setting,next_ip_adapter_setting,apply_edit_ip_adapter_setting,complete_cip_adapter_setting,edit_ip_adapter_setting,apply_ip_adapter_setting
 def edit_ip_adapter_setting_function():
     global lst_ip_adapter,current_number_ip_adapter
     if len(lst_ip_adapter) == 0:
@@ -1948,7 +2052,6 @@ def complete_cip_adapter_setting_function():
     )
 
 
-#model_ip_adapter,inf_adapt_image_multi,inf_adapt_image_strength_multi,previous_ip_adapter_setting,next_ip_adapter_setting,edit_ip_adapter_setting,apply_ip_adapter_setting,apply_edit_ip_adapter_setting,complete_cip_adapter_setting
 def apply_edit_ip_adapter_setting_function(model_ip_adapter,inf_adapt_image_multi,inf_adapt_image_strength_multi,inf_control_adapt_image_multi):
     global lst_ip_adapter,current_number_ip_adapter
     if inf_adapt_image_multi is not None:
@@ -2000,8 +2103,16 @@ def apply_edit_ip_adapter_setting_function(model_ip_adapter,inf_adapt_image_mult
         gr.Image.update(value = lst_ip_adapter[current_number_ip_adapter]["region_apply"]),
     )
 
+def inpaiting_mode_fuction(inpaiting_mode):
+    if inpaiting_mode:
+        return gr.Image.update(visible = False),gr.Image.update(visible = True), gr.Image.update(visible = True),gr.Checkbox.update(visible = True),gr.Button.update(visible = True),gr.Slider.update(value = 1.0)
+    return gr.Image.update(visible = True),gr.Image.update(visible = False), gr.Image.update(visible = False),gr.Checkbox.update(visible = False),gr.Button.update(visible = False),gr.Slider.update(value = 0.5)
 
-
+def get_mask_fuction(inf_image_inpaiting):
+    img_mask = None
+    if isinstance(inf_image_inpaiting,dict):
+        img_mask = inf_image_inpaiting["mask"].copy()
+    return gr.Image.update(img_mask)
 
 latent_upscale_modes = {
     "Latent (bilinear)": {"upscale_method": "bilinear", "upscale_antialias": False},
@@ -2091,13 +2202,13 @@ with gr.Blocks(css=css) as demo:
 
                         prompt = gr.Textbox(
                             label="Prompt",
-                            value="A lovely girl sitting on a bridge",
+                            value="A girl sitting on the bridge",
                             show_label=True,
                             placeholder="Enter prompt.",
                         )
                         neg_prompt = gr.Textbox(
                             label="Negative Prompt",
-                            value="bad quality",
+                            value="bad quality, low quality, jpeg artifact, cropped",
                             show_label=True,
                             placeholder="Enter negative prompt.",
                         )
@@ -2111,7 +2222,7 @@ with gr.Blocks(css=css) as demo:
                 with gr.Group():
 
                     with gr.Row():
-                        diffuser_pipeline = gr.Checkbox(label="Using diffusers samplers", value=False)
+                        diffuser_pipeline = gr.Checkbox(label="Using diffusers sampler", value=False)
                         latent_processing = gr.Checkbox(label="Show processing", value=False)
                         region_condition = gr.Checkbox(label="Enable Spatial Control", value=False)
                     with gr.Row():
@@ -2163,17 +2274,40 @@ with gr.Blocks(css=css) as demo:
                     )
                     
 
-            with gr.Tab("Image to image"):
+            with gr.Tab("Image to image/Inpaiting"):
                 with gr.Group():
-                    inf_image = gr.Image(
-                        label="Image", source="upload", type="pil"
-                    )
+                    with gr.Row():
+                        inpaiting_mode = gr.Checkbox(label="Inpaiting", value=False)
+                        invert_mask_mode = gr.Checkbox(label="Black areas are used", value=False,visible = False)
+                    with gr.Row():
+                        inf_image = gr.Image(
+                            label="Image", source="upload", type="pil",
+                        )
+                        inf_image_inpaiting = gr.Image(
+                            label="Image", source="upload", type="pil", tool="sketch",visible = False
+                        )
+                        mask_upload = gr.Image(
+                            label="Mask", source="upload", type="pil",image_mode='L',visible = False,
+                        )
                     inf_strength = gr.Slider(
                         label="Transformation strength",
                         minimum=0,
                         maximum=1,
                         step=0.01,
                         value=0.5,
+                    )
+                    get_mask = gr.Button(value="Get mask",visible = False)
+                    inpaiting_mode.change(
+                        inpaiting_mode_fuction,
+                        inputs=[inpaiting_mode],
+                        outputs=[inf_image,inf_image_inpaiting,mask_upload,invert_mask_mode,get_mask,inf_strength],
+                        queue=False,
+                    )
+                    get_mask.click(
+                        get_mask_fuction,
+                        inputs=[inf_image_inpaiting],
+                        outputs=[mask_upload],
+                        queue=False,
                     )
             with gr.Tab("Hires fix"):
                 with gr.Group():
@@ -2233,6 +2367,7 @@ with gr.Blocks(css=css) as demo:
                     with gr.Row():
                         ip_adapter = gr.Checkbox(label="Using IP-Adapter", value=False)
                         ip_adapter_multi = gr.Checkbox(label="Using Multi IP-Adapter", value=False)
+                        invert_ip_adapter_mask_mode = gr.Checkbox(label="Black areas are used", value=True)
                     model_ip_adapter = gr.Dropdown(
                         choices=[k for k in model_ip_adapter_lst],
                         label="Model IP-Adapter",
@@ -2244,13 +2379,13 @@ with gr.Blocks(css=css) as demo:
                             label="IP-Adapter", source="upload", type="pil"
                         )
                         inf_control_adapt_image = gr.Image(
-                            label="Region apply(Black masks are the regions you want to apply)", source="upload", type="pil",image_mode='L'
+                            label="Region apply", source="upload", type="pil",image_mode='L'
                         )
                         inf_adapt_image_multi = gr.Image(
                             label="IP-Adapter", source="upload", type="pil",visible= False
                         )
                         inf_control_adapt_image_multi = gr.Image(
-                            label="Region apply(Black masks are the regions you want to apply)", source="upload", type="pil",image_mode='L',visible= False
+                            label="Region apply", source="upload", type="pil",image_mode='L',visible= False
                         )
                     inf_adapt_image_strength = gr.Slider(
                         label="IP-Adapter scale",
@@ -2643,6 +2778,7 @@ with gr.Blocks(css=css) as demo:
                     queue=False,
                 )
 
+
     gr.HTML(
         f"""
             <div class="finetuned-diffusion-div">
@@ -2651,7 +2787,7 @@ with gr.Blocks(css=css) as demo:
               </div>
               <p>
                 Define the object's region.
-                The black areas of images represent the regions which you want to control when extracting color regions.
+                The black areas of images represent the regions which users want to control.
               </p>
             </div>
         """
@@ -2660,11 +2796,6 @@ with gr.Blocks(css=css) as demo:
     with gr.Row():
 
         with gr.Column(scale=55):
-            formula_button = gr.Dropdown(
-                choices=[k[0] for k in formula],
-                label="Formual",
-                value=formula[0][0],
-            )
 
             rendered = gr.Image(
                 invert_colors=True,
@@ -2690,6 +2821,7 @@ with gr.Blocks(css=css) as demo:
                     sk_update = gr.Button(value="Update").style(
                         rounded=(False, True, True, False)
                     )
+
 
             with gr.Tab("SketchPad"):
 
@@ -2721,21 +2853,21 @@ with gr.Blocks(css=css) as demo:
 
                 width.change(
                     apply_size_sketch,
-                    inputs=[width, height,global_stats,inf_image],
+                    inputs=[width, height,global_stats,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats, rendered,sp],
                     queue=False,
                 )
 
                 height.change(
                     apply_size_sketch,
-                    inputs=[width, height,global_stats,inf_image],
+                    inputs=[width, height,global_stats,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats, rendered,sp],
                     queue=False,
                 )
 
                 inf_image.change(
                     apply_size_sketch,
-                    inputs=[width, height,global_stats,inf_image],
+                    inputs=[width, height,global_stats,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats, rendered,sp],
                     queue=False,
                 )
@@ -2743,19 +2875,19 @@ with gr.Blocks(css=css) as demo:
 
                 sk_update.click(
                     detect_text,
-                    inputs=[text, global_stats, width, height,formula_button,inf_image],
-                    outputs=[global_stats, sp, radio, rendered,formula_button],
+                    inputs=[text, global_stats, width, height,inf_image,inpaiting_mode,inf_image_inpaiting],
+                    outputs=[global_stats, sp, radio, rendered],
                     queue=False,
                 )
                 radio.change(
                     switch_canvas,
-                    inputs=[radio, global_stats, width, height,inf_image],
+                    inputs=[radio, global_stats, width, height,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[sp, strength, mask_outsides, rendered],
                     queue=False,
                 )
                 sp.edit(
                     apply_canvas,
-                    inputs=[radio, sp, global_stats, width, height,inf_image],
+                    inputs=[radio, sp, global_stats, width, height,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats, rendered],
                     queue=False,
                 )
@@ -2789,7 +2921,6 @@ with gr.Blocks(css=css) as demo:
                     previous_page = gr.Button(value="Previous",visible = False,)
                     next_page = gr.Button(value="Next",visible = False,)
 
-
                 with gr.Row():
                     mask_outsides2 = gr.Slider(
                         label="Decrease unmarked region weight",
@@ -2818,13 +2949,13 @@ with gr.Blocks(css=css) as demo:
                 
                 apply_style.click(
                     apply_image,
-                    inputs=[sp2, radio, width, height, strength2, mask_outsides2, global_stats,inf_image],
+                    inputs=[sp2, radio, width, height, strength2, mask_outsides2, global_stats,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats, rendered],
                     queue=False,
                 )
                 apply_clustering_style.click(
                     apply_base_on_color,
-                    inputs=[sp2,global_stats,width, height,inf_image],
+                    inputs=[sp2,global_stats,width, height,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[rendered,apply_style,apply_clustering_style,previous_page,next_page,complete_clustering,sp2,sp3,add_style,global_stats],
                     queue=False,
                 )
@@ -2842,7 +2973,7 @@ with gr.Blocks(css=css) as demo:
                 )
                 add_style.click(
                     apply_image_clustering,
-                    inputs=[sp3, radio, width, height, strength2, mask_outsides2, global_stats,inf_image],
+                    inputs=[sp3, radio, width, height, strength2, mask_outsides2, global_stats,inf_image,inpaiting_mode,inf_image_inpaiting],
                     outputs=[global_stats,rendered],
                     queue=False,
                 )
@@ -2864,7 +2995,6 @@ with gr.Blocks(css=css) as demo:
         seed,
         neg_prompt,
         global_stats,
-        #g_strength,
         inf_image,
         inf_strength,
         hr_enabled,
@@ -2876,7 +3006,6 @@ with gr.Blocks(css=css) as demo:
         model,
         lora_vals,
         lora_scale,
-        formula_button,
         controlnet_enabled,
         model_control_net,
         low_threshold,
@@ -2920,6 +3049,11 @@ with gr.Blocks(css=css) as demo:
         guidance_rescale,
         inf_control_adapt_image,
         long_encode,
+        inpaiting_mode,
+        invert_mask_mode,
+        mask_upload,
+        inf_image_inpaiting,
+        invert_ip_adapter_mask_mode,
     ]
     outputs = [image_out,gallery]
     prompt.submit(inference, inputs=inputs, outputs=outputs)

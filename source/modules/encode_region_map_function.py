@@ -22,6 +22,7 @@ def encode_region_map_sp(state,tokenizer,unet,width,height, scale_ratio=8, text_
         if text_ids is None:
             return torch.FloatTensor(0)
         uncond, cond = text_ids[0], text_ids[1]
+
         w_tensors = dict()
         cond = cond.reshape(-1,).tolist() if isinstance(cond,np.ndarray) or isinstance(cond, torch.Tensor) else None
         uncond = uncond.reshape(-1,).tolist() if isinstance(uncond,np.ndarray) or isinstance(uncond, torch.Tensor) else None
@@ -31,6 +32,7 @@ def encode_region_map_sp(state,tokenizer,unet,width,height, scale_ratio=8, text_
 
             ret_cond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
             ret_uncond_tensor = torch.zeros((1, int(w_r * h_r), c), dtype=torch.float32)
+
             if state is not None:
                 for k, v in state.items():
                     if v["map"] is None:

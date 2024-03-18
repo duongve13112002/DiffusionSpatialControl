@@ -110,7 +110,7 @@ class DiscreteEpsDDPMDenoiser(DiscreteSchedule):
         c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
         eps = self.get_eps(input * c_in, self.sigma_to_t(sigma), **kwargs)
 # !!! fix for special models (controlnet, inpaint, depth, ..)
-        input = input[:, :eps.shape[1], :, :]
+        input = input[:, :eps.shape[1],...]
         return input + eps * c_out
 
 
@@ -165,7 +165,11 @@ class DiscreteVDDPMDenoiser(DiscreteSchedule):
 
     def forward(self, input, sigma, **kwargs):
         c_skip, c_out, c_in = [utils.append_dims(x, input.ndim) for x in self.get_scalings(sigma)]
-        return self.get_v(input * c_in, self.sigma_to_t(sigma), **kwargs) * c_out + input * c_skip
+        vout = self.get_v(input * c_in, self.sigma_to_t(sigma), **kwargs) * c_out
+        # !!! fix for special models (controlnet, upscale, ..)
+        input = input[:, :vout.shape[1],...]
+        return vout + input * c_skip
+        #return self.get_v(input * c_in, self.sigma_to_t(sigma), **kwargs) * c_out + input * c_skip
 
 
 class CompVisVDenoiser(DiscreteVDDPMDenoiser):

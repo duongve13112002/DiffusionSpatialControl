@@ -8,8 +8,6 @@ from diffusers.utils import (
     set_weights_and_activate_adapters,
 )
 
-#from modules.model_diffusers import CrossAttnProcessor
-#from modules.ip_adapter import IPAdapterAttnProcessor
 import torch
 import torch.nn.functional as F
 from torch.autograd.function import Function
@@ -24,7 +22,7 @@ from diffusers.models.embeddings import ImageProjection
 from diffusers.models.modeling_utils import _LOW_CPU_MEM_USAGE_DEFAULT, load_model_dict_into_meta
 import math
 from einops import rearrange
-from modules.ip_adapter_processor import IPAdapterMaskProcessor
+from diffusers.image_processor import IPAdapterMaskProcessor
 
 xformers_available = False
 try:
@@ -105,7 +103,6 @@ def scaled_dot_product_attention_regionstate(query, key, value, attn_mask=None, 
     return attn_weight @ value
 
 
-
 class AttnProcessor(nn.Module):
     def __call__(
         self,
@@ -122,7 +119,7 @@ class AttnProcessor(nn.Module):
 
         args = () if USE_PEFT_BACKEND else (scale,)
 
-        _,img_sequence_length,_ = hidden_states.shape
+        img_sequence_length = hidden_states.shape[1]
 
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
@@ -258,7 +255,7 @@ class IPAdapterAttnProcessor(nn.Module):
         ip_adapter_masks = None,
     ):
 
-        _,img_sequence_length,_ = hidden_states.shape
+        img_sequence_length= hidden_states.shape[1]
         residual = hidden_states
 
         is_xattn = False
@@ -350,32 +347,6 @@ class IPAdapterAttnProcessor(nn.Module):
         hidden_states = attn.batch_to_head_dim(hidden_states)
 
 
-        '''# for ip-adapter
-        for current_ip_hidden_states, scale, to_k_ip, to_v_ip in zip(
-            ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip
-        ):
-            ip_key = to_k_ip(current_ip_hidden_states)
-            ip_value = to_v_ip(current_ip_hidden_states)
-
-            ip_key = attn.head_to_batch_dim(ip_key)
-            ip_value = attn.head_to_batch_dim(ip_value)
-
-            if xformers_available:
-                current_ip_hidden_states = xformers.ops.memory_efficient_attention(
-                    query.contiguous(),
-                    ip_key.contiguous(),
-                    ip_value.contiguous(),
-                    attn_bias=None,
-                )
-                current_ip_hidden_states = current_ip_hidden_states.to(query.dtype)
-            else:
-                ip_attention_probs = attn.get_attention_scores(query, ip_key, None)
-                current_ip_hidden_states = torch.bmm(ip_attention_probs, ip_value)
-                current_ip_hidden_states = current_ip_hidden_states.to(query.dtype)
-            
-            current_ip_hidden_states = attn.batch_to_head_dim(current_ip_hidden_states)
-            hidden_states = hidden_states + scale * current_ip_hidden_states'''
-
         #control region apply ip-adapter
         if ip_adapter_masks is not None:
             if not isinstance(ip_adapter_masks, torch.Tensor) or ip_adapter_masks.ndim != 4:
@@ -388,7 +359,7 @@ class IPAdapterAttnProcessor(nn.Module):
                     f"Number of ip_adapter_masks ({len(ip_adapter_masks)}) must match number of IP-Adapters ({len(self.scale)})"
                 )
         else:
-            ip_adapter_masks = [None] * len(ip_hidden_states)
+            ip_adapter_masks = [None] * len(self.scale)
 
         # for ip-adapter
         for current_ip_hidden_states, scale, to_k_ip, to_v_ip, mask in zip(
@@ -412,8 +383,6 @@ class IPAdapterAttnProcessor(nn.Module):
                 current_ip_hidden_states = current_ip_hidden_states * mask_downsample
 
             hidden_states = hidden_states + scale * current_ip_hidden_states
-
-
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
@@ -455,7 +424,7 @@ class AttnProcessor2_0:
     ) -> torch.FloatTensor:
         residual = hidden_states
 
-        _,img_sequence_length,_ = hidden_states.shape
+        img_sequence_length= hidden_states.shape[1]
         if attn.spatial_norm is not None:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
@@ -590,7 +559,7 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
     ):
         residual = hidden_states
 
-        _,img_sequence_length,_ = hidden_states.shape
+        img_sequence_length= hidden_states.shape[1]
 
         is_xattn = False
         if encoder_hidden_states is not None and region_prompt is not None:
@@ -663,7 +632,6 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
         # TODO: add support for attn.scale when we move to Torch 2.1
 
         if is_xattn and isinstance(region_state, dict):
-            #w = attn.head_to_batch_dim(w,out_dim = 4).transpose(1, 2)
             hidden_states = scaled_dot_product_attention_regionstate(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False,weight_func = weight_func,region_state=region_state[img_sequence_length].to(query.device),sigma = sigma)
         else:
             hidden_states = F.scaled_dot_product_attention(
@@ -672,29 +640,6 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
-
-        ''''# for ip-adapter
-        for current_ip_hidden_states, scale, to_k_ip, to_v_ip in zip(
-            ip_hidden_states, self.scale, self.to_k_ip, self.to_v_ip
-        ):
-            ip_key = to_k_ip(current_ip_hidden_states)
-            ip_value = to_v_ip(current_ip_hidden_states)
-
-            ip_key = ip_key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-            ip_value = ip_value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
-            # the output of sdp = (batch, num_heads, seq_len, head_dim)
-            # TODO: add support for attn.scale when we move to Torch 2.1
-            current_ip_hidden_states = F.scaled_dot_product_attention(
-                query, ip_key, ip_value, attn_mask=None, dropout_p=0.0, is_causal=False
-            )
-
-            current_ip_hidden_states = current_ip_hidden_states.transpose(1, 2).reshape(
-                batch_size, -1, attn.heads * head_dim
-            )
-            current_ip_hidden_states = current_ip_hidden_states.to(query.dtype)
-
-            hidden_states = hidden_states + scale * current_ip_hidden_states'''
 
 
         if ip_adapter_masks is not None:
@@ -708,7 +653,7 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
                     f"Number of ip_adapter_masks ({len(ip_adapter_masks)}) must match number of IP-Adapters ({len(self.scale)})"
                 )
         else:
-            ip_adapter_masks = [None] * len(ip_hidden_states)
+            ip_adapter_masks = [None] * len(self.scale)
 
         # for ip-adapter
         for current_ip_hidden_states, scale, to_k_ip, to_v_ip, mask in zip(
@@ -733,7 +678,7 @@ class IPAdapterAttnProcessor2_0(torch.nn.Module):
                     mask, batch_size, current_ip_hidden_states.shape[1], current_ip_hidden_states.shape[2]
                 )
 
-                mask_downsample = mask_downsample.to(query.dtype).to(current_ip_hidden_states.device)
+                mask_downsample = mask_downsample.to(dtype=query.dtype, device=query.device)
 
                 current_ip_hidden_states = current_ip_hidden_states * mask_downsample
 

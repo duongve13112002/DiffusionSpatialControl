@@ -18,7 +18,6 @@ from modules.external_k_diffusion import CompVisDenoiser, CompVisVDenoiser
 from torch import einsum
 from torch.autograd.function import Function
 
-from diffusers import DiffusionPipeline
 from diffusers.utils import PIL_INTERPOLATION, is_accelerate_available
 from diffusers.utils import logging
 from diffusers.utils.torch_utils import randn_tensor,is_compiled_module
@@ -35,6 +34,8 @@ import gc
 from modules.t2i_adapter import preprocessing_t2i_adapter,default_height_width
 from modules.encoder_prompt_modify import encode_prompt_function
 from modules.encode_region_map_function import encode_region_map
+from diffusers.pipelines.pipeline_utils import DiffusionPipeline, StableDiffusionMixin
+from diffusers.loaders import LoraLoaderMixin
 
 def get_image_size(image):
     height, width = None, None
@@ -53,6 +54,18 @@ def get_image_size(image):
     else:
         raise TypeError("The image must be an instance of PIL.Image, numpy.ndarray, or torch.Tensor.")
 
+
+def retrieve_latents(
+    encoder_output: torch.Tensor, generator: Optional[torch.Generator] = None, sample_mode: str = "sample"
+):
+    if hasattr(encoder_output, "latent_dist") and sample_mode == "sample":
+        return encoder_output.latent_dist.sample(generator)
+    elif hasattr(encoder_output, "latent_dist") and sample_mode == "argmax":
+        return encoder_output.latent_dist.mode()
+    elif hasattr(encoder_output, "latents"):
+        return encoder_output.latents
+    else:
+        raise AttributeError("Could not access latents of provided encoder_output")
 
 # from diffusers.pipelines.stable_diffusion.pipeline_stable_diffusion.rescale_noise_cfg
 def rescale_noise_cfg(noise_cfg, noise_pred_text, guidance_rescale=0.0):
@@ -85,7 +98,7 @@ class ModelWrapper:
         ).sample
 
 
-class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
+class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline,StableDiffusionMixin,LoraLoaderMixin):
 
     _optional_components = ["safety_checker", "feature_extractor"]
 
@@ -113,6 +126,10 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         )
         self.controlnet = None
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor)
+        self.mask_processor = VaeImageProcessor(
+            vae_scale_factor=self.vae_scale_factor, do_normalize=False, do_binarize=True, do_convert_grayscale=True
+        )
         self.setup_unet(self.unet)
 
     def setup_unet(self, unet):
@@ -152,31 +169,55 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
 
             return image_embeds, uncond_image_embeds
 
-    def prepare_ip_adapter_image_embeds(self, ip_adapter_image, device, num_images_per_prompt):
-        if not isinstance(ip_adapter_image, list):
-            ip_adapter_image = [ip_adapter_image]
 
-        if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
-            raise ValueError(
-                f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
-            )
+    def prepare_ip_adapter_image_embeds(
+        self, ip_adapter_image, ip_adapter_image_embeds, device, num_images_per_prompt, do_classifier_free_guidance
+    ):
+        if ip_adapter_image_embeds is None:
+            if not isinstance(ip_adapter_image, list):
+                ip_adapter_image = [ip_adapter_image]
 
-        image_embeds = []
-        for single_ip_adapter_image, image_proj_layer in zip(
-            ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
-        ):
-            output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
-            single_image_embeds, single_negative_image_embeds = self.encode_image(
-                single_ip_adapter_image, device, 1, output_hidden_state
-            )
-            single_image_embeds = torch.stack([single_image_embeds] * num_images_per_prompt, dim=0)
-            single_negative_image_embeds = torch.stack([single_negative_image_embeds] * num_images_per_prompt, dim=0)
+            if len(ip_adapter_image) != len(self.unet.encoder_hid_proj.image_projection_layers):
+                raise ValueError(
+                    f"`ip_adapter_image` must have same length as the number of IP Adapters. Got {len(ip_adapter_image)} images and {len(self.unet.encoder_hid_proj.image_projection_layers)} IP Adapters."
+                )
 
-            if self.do_classifier_free_guidance:
-                single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
-                single_image_embeds = single_image_embeds.to(device)
+            image_embeds = []
+            for single_ip_adapter_image, image_proj_layer in zip(
+                ip_adapter_image, self.unet.encoder_hid_proj.image_projection_layers
+            ):
+                output_hidden_state = not isinstance(image_proj_layer, ImageProjection)
+                single_image_embeds, single_negative_image_embeds = self.encode_image(
+                    single_ip_adapter_image, device, 1, output_hidden_state
+                )
+                single_image_embeds = torch.stack([single_image_embeds] * num_images_per_prompt, dim=0)
+                single_negative_image_embeds = torch.stack(
+                    [single_negative_image_embeds] * num_images_per_prompt, dim=0
+                )
 
-            image_embeds.append(single_image_embeds)
+                if do_classifier_free_guidance:
+                    single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
+                    single_image_embeds = single_image_embeds.to(device)
+
+                image_embeds.append(single_image_embeds)
+        else:
+            repeat_dims = [1]
+            image_embeds = []
+            for single_image_embeds in ip_adapter_image_embeds:
+                if do_classifier_free_guidance:
+                    single_negative_image_embeds, single_image_embeds = single_image_embeds.chunk(2)
+                    single_image_embeds = single_image_embeds.repeat(
+                        num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
+                    )
+                    single_negative_image_embeds = single_negative_image_embeds.repeat(
+                        num_images_per_prompt, *(repeat_dims * len(single_negative_image_embeds.shape[1:]))
+                    )
+                    single_image_embeds = torch.cat([single_negative_image_embeds, single_image_embeds])
+                else:
+                    single_image_embeds = single_image_embeds.repeat(
+                        num_images_per_prompt, *(repeat_dims * len(single_image_embeds.shape[1:]))
+                    )
+                image_embeds.append(single_image_embeds)
 
         return image_embeds
 
@@ -256,6 +297,29 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         # we always cast to float32 as this does not cause significant overhead and is compatible with bfloa16
         image = image.cpu().permute(0, 2, 3, 1).float().numpy()
         return image
+
+
+    def _default_height_width(self, height, width, image):
+        if isinstance(image, list):
+            image = image[0]
+
+        if height is None:
+            if isinstance(image, PIL.Image.Image):
+                height = image.height
+            elif isinstance(image, torch.Tensor):
+                height = image.shape[3]
+
+            height = (height // 8) * 8  # round down to nearest multiple of 8
+
+        if width is None:
+            if isinstance(image, PIL.Image.Image):
+                width = image.width
+            elif isinstance(image, torch.Tensor):
+                width = image.shape[2]
+
+            width = (width // 8) * 8  # round down to nearest multiple of 8
+
+        return height, width
 
     def check_inputs(self, prompt, height, width, callback_steps):
         if not isinstance(prompt, str) and not isinstance(prompt, list):
@@ -456,7 +520,8 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         """
         if images.ndim == 3:
             images = images[None, ...]
-        images = (images * 255).round().astype("uint8")
+        #images = (images * 255).round().astype("uint8")
+        images = np.clip((images * 255).round(), 0, 255).astype("uint8")
         if images.shape[-1] == 1:
             # special case for grayscale (single channel) images
             pil_images = [Image.fromarray(image.squeeze(), mode="L") for image in images]
@@ -518,6 +583,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         clip_skip = None,
         long_encode = 0,
         num_images_per_prompt = 1,
+        ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
     ):
         if isinstance(sampler_name, str):
             sampler = self.get_scheduler(sampler_name)
@@ -586,7 +652,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             dtype=text_embeddings.dtype,
         )
         latents = latents.to(device)
-        latents = latents + noise * sigma_sched[0]
+        latents = latents + noise * (sigma_sched[0]**2 + 1) ** 0.5
         steps_denoising = len(sigma_sched)
         # 5. Prepare latent variables
         self.k_diffusion_model.sigmas = self.k_diffusion_model.sigmas.to(latents.device)
@@ -613,12 +679,20 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         if self.controlnet is not None:
             img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,len(sigma_sched),batch_size,num_images_per_prompt)
 
-        if ip_adapter_image is not None:
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image, device, batch_size * num_images_per_prompt
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+                self.do_classifier_free_guidance,
             )
         # 6.1 Add image embeds for IP-Adapter
-        added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
+        added_cond_kwargs = (
+            {"image_embeds": image_embeds}
+            if (ip_adapter_image is not None or ip_adapter_image_embeds is not None)
+            else None
+        )
         if latent_processing == 1:
             latents_process = [self.latent_to_image(latents,output_type)]
         lst_latent_sigma = []
@@ -695,6 +769,8 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             noise_pred = self.k_diffusion_model(
                 latent_model_input, sigma, cond=text_embeddings,cross_attention_kwargs = cross_attention_kwargs,down_intrablock_additional_residuals = down_intrablock_additional_residuals,added_cond_kwargs=added_cond_kwargs, **ukwargs
             )
+
+            
             if self.do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                 noise_pred = noise_pred_uncond + guidance_scale * (
@@ -761,7 +837,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             torch.cuda.empty_cache()
             gc.collect()
             return latent_reisze
-    
+  
         if latent_processing == 1:
             return latents_process
         self.maybe_free_model_hooks()
@@ -906,7 +982,9 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         clip_skip = None,
         long_encode = 0,
         num_images_per_prompt = 1,
+        ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
     ):
+        height, width = self._default_height_width(height, width, None)
         if isinstance(sampler_name, str):
             sampler = self.get_scheduler(sampler_name)
         else:
@@ -914,7 +992,6 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
         # 1. Check inputs. Raise error if not correct
         if image_t2i_adapter is not None:
             height, width = default_height_width(self,height, width, image_t2i_adapter)
-            #print(default_height_width(self,height, width, image_t2i_adapter))
         self.check_inputs(prompt, height, width, callback_steps)
         # 2. Define call parameters
         batch_size = 1 if isinstance(prompt, str) else len(prompt)
@@ -963,7 +1040,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             generator,
             latents,
         )
-        latents = latents * sigmas[0]
+        latents = latents * (sigmas[0]**2 + 1) ** 0.5
         steps_denoising = len(sigmas)
         self.k_diffusion_model.sigmas = self.k_diffusion_model.sigmas.to(latents.device)
         self.k_diffusion_model.log_sigmas = self.k_diffusion_model.log_sigmas.to(
@@ -989,15 +1066,22 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,num_inference_steps,batch_size,num_images_per_prompt)
         
 
-        if ip_adapter_image is not None:
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
             image_embeds = self.prepare_ip_adapter_image_embeds(
-                ip_adapter_image, device, batch_size * num_images_per_prompt
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+                self.do_classifier_free_guidance,
             )
         # 6.1 Add image embeds for IP-Adapter
-        added_cond_kwargs = {"image_embeds": image_embeds} if ip_adapter_image is not None else None
+        added_cond_kwargs = (
+            {"image_embeds": image_embeds}
+            if (ip_adapter_image is not None or ip_adapter_image_embeds is not None)
+            else None
+        )
         if latent_processing == 1:
             latents_process = [self.latent_to_image(latents,output_type)]
-        #sp_find_new = None
         lst_latent_sigma = []
         step_control = -1
         adapter_state = None
@@ -1017,6 +1101,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 "weight_func": weight_func,
               }
             cross_attention_kwargs["region_prompt"] = region_prompt
+
             if latent_model_input.dtype != text_embeddings.dtype:
                 latent_model_input = latent_model_input.to(text_embeddings.dtype)
             ukwargs = {}
@@ -1034,6 +1119,7 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
             if self.controlnet is not None :
                 sigma_string = str(sigma.item())
                 if sigma_string not in lst_latent_sigma:
+                    #sigmas_sp = sigma.detach().clone()
                     step_control+=1
                     lst_latent_sigma.append(sigma_string)
 
@@ -1082,6 +1168,535 @@ class StableDiffusionPipeline(IPAdapterMixin,DiffusionPipeline):
                 noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
             if latent_processing == 1:
                 latents_process.append(self.latent_to_image(noise_pred,output_type))
+            return noise_pred
+        extra_args = self.get_sampler_extra_args_t2i(
+            sigmas, eta, num_inference_steps,sampler_opt,latents,seed, sampler
+        )
+        latents = sampler(model_fn, latents, **extra_args)
+        self.maybe_free_model_hooks()
+        torch.cuda.empty_cache()
+        gc.collect()
+        if upscale:
+            vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+            target_height = int(height * upscale_x // vae_scale_factor  )* 8
+            target_width = int(width * upscale_x // vae_scale_factor)*8
+            latents = torch.nn.functional.interpolate(
+                latents,
+                size=(
+                    int(target_height // vae_scale_factor),
+                    int(target_width // vae_scale_factor),
+                ),
+                mode=upscale_method,
+                antialias=upscale_antialias,
+            )
+            latent_reisze= self.img2img(
+                prompt=prompt,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                negative_prompt=negative_prompt,
+                generator=generator,
+                latents=latents,
+                strength=upscale_denoising_strength,
+                sampler_name=sampler_name_hires,
+                sampler_opt=sampler_opt_hires,
+                region_map_state = region_map_state,
+                latent_processing = latent_upscale_processing,
+                width = int(target_width),
+                height = int(target_height),
+                seed = seed,
+                ip_adapter_image = ip_adapter_image,
+                control_img = control_img,
+                controlnet_conditioning_scale = controlnet_conditioning_scale_copy,
+                control_guidance_start = control_guidance_start_copy,
+                control_guidance_end = control_guidance_end_copy,
+                image_t2i_adapter= image_t2i_adapter,
+                adapter_conditioning_scale = adapter_conditioning_scale,
+                adapter_conditioning_factor = adapter_conditioning_factor,
+                guidance_rescale = guidance_rescale,
+                cross_attention_kwargs = cross_attention_kwargs,
+                clip_skip = clip_skip,
+                long_encode = long_encode,
+                num_images_per_prompt = num_images_per_prompt,
+            )
+            if latent_processing == 1:
+                latents_process= latents_process+latent_reisze
+                return latents_process
+            torch.cuda.empty_cache()
+            gc.collect()
+            return latent_reisze
+
+        # 8. Post-processing
+        if latent_processing == 1:
+            return latents_process
+        return [self.latent_to_image(latents,output_type)]
+
+
+    def _encode_vae_image(self, image: torch.Tensor, generator: torch.Generator):
+        if isinstance(generator, list):
+            image_latents = [
+                retrieve_latents(self.vae.encode(image[i : i + 1]), generator=generator[i])
+                for i in range(image.shape[0])
+            ]
+            image_latents = torch.cat(image_latents, dim=0)
+        else:
+            image_latents = retrieve_latents(self.vae.encode(image), generator=generator)
+
+        image_latents = self.vae.config.scaling_factor * image_latents
+
+        return image_latents
+    
+    def prepare_mask_latents(
+        self, mask, masked_image, batch_size, height, width, dtype, device, generator, do_classifier_free_guidance
+    ):
+        # resize the mask to latents shape as we concatenate the mask to the latents
+        # we do that before converting to dtype to avoid breaking in case we're using cpu_offload
+        # and half precision
+        mask = torch.nn.functional.interpolate(
+            mask, size=(height // self.vae_scale_factor, width // self.vae_scale_factor)
+        )
+        mask = mask.to(device=device, dtype=dtype)
+
+        masked_image = masked_image.to(device=device, dtype=dtype)
+
+        if masked_image.shape[1] == 4:
+            masked_image_latents = masked_image
+        else:
+            masked_image_latents = self._encode_vae_image(masked_image, generator=generator)
+
+        # duplicate mask and masked_image_latents for each generation per prompt, using mps friendly method
+        if mask.shape[0] < batch_size:
+            if not batch_size % mask.shape[0] == 0:
+                raise ValueError(
+                    "The passed mask and the required batch size don't match. Masks are supposed to be duplicated to"
+                    f" a total batch size of {batch_size}, but {mask.shape[0]} masks were passed. Make sure the number"
+                    " of masks that you pass is divisible by the total requested batch size."
+                )
+            mask = mask.repeat(batch_size // mask.shape[0], 1, 1, 1)
+        if masked_image_latents.shape[0] < batch_size:
+            if not batch_size % masked_image_latents.shape[0] == 0:
+                raise ValueError(
+                    "The passed images and the required batch size don't match. Images are supposed to be duplicated"
+                    f" to a total batch size of {batch_size}, but {masked_image_latents.shape[0]} images were passed."
+                    " Make sure the number of images that you pass is divisible by the total requested batch size."
+                )
+            masked_image_latents = masked_image_latents.repeat(batch_size // masked_image_latents.shape[0], 1, 1, 1)
+
+        mask = torch.cat([mask] * 2) if do_classifier_free_guidance else mask
+        masked_image_latents = (
+            torch.cat([masked_image_latents] * 2) if do_classifier_free_guidance else masked_image_latents
+        )
+
+        # aligning device to prevent device errors when concating it with the latent model input
+        masked_image_latents = masked_image_latents.to(device=device, dtype=dtype)
+        return mask, masked_image_latents
+
+    def _sigma_to_alpha_sigma_t(self, sigma):
+        alpha_t = 1 / ((sigma**2 + 1) ** 0.5)
+        sigma_t = sigma * alpha_t
+
+        return alpha_t, sigma_t
+
+    def add_noise(self,init_latents_proper,noise,sigma):
+        if isinstance(sigma, torch.Tensor) and sigma.numel() > 1:
+            sigma,_ = sigma.sort(descending=True)
+            sigma = sigma[0].item()
+        init_latents_proper = init_latents_proper + sigma * noise
+        return init_latents_proper
+
+    def prepare_latents_inpating(
+        self,
+        batch_size,
+        num_channels_latents,
+        height,
+        width,
+        dtype,
+        device,
+        generator,
+        latents=None,
+        image=None,
+        sigma=None,
+        is_strength_max=True,
+        return_noise=False,
+        return_image_latents=False,
+    ):
+        shape = (batch_size, num_channels_latents, height // self.vae_scale_factor, width // self.vae_scale_factor)
+        if isinstance(generator, list) and len(generator) != batch_size:
+            raise ValueError(
+                f"You have passed a list of generators of length {len(generator)}, but requested an effective batch"
+                f" size of {batch_size}. Make sure the batch size matches the length of the generators."
+            )
+
+        if (image is None or sigma is None) and not is_strength_max:
+            raise ValueError(
+                "Since strength < 1. initial latents are to be initialised as a combination of Image + Noise."
+                "However, either the image or the noise sigma has not been provided."
+            )
+
+        if return_image_latents or (latents is None and not is_strength_max):
+            image = image.to(device=device, dtype=dtype)
+
+            if image.shape[1] == 4:
+                image_latents = image
+            else:
+                image_latents = self._encode_vae_image(image=image, generator=generator)
+            image_latents = image_latents.repeat(batch_size // image_latents.shape[0], 1, 1, 1)
+
+        if latents is None:
+            noise = randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+            # if strength is 1. then initialise the latents to noise, else initial to image + noise
+            latents = noise if is_strength_max else self.add_noise(image_latents, noise, sigma)
+            # if pure noise then scale the initial latents by the  Scheduler's init sigma
+            latents = latents * (sigma.item()**2 + 1) ** 0.5 if is_strength_max else latents
+        else:
+            noise = latents.to(device)
+            latents = noise * (sigma.item()**2 + 1) ** 0.5
+
+        outputs = (latents,)
+
+        if return_noise:
+            outputs += (noise,)
+
+        if return_image_latents:
+            outputs += (image_latents,)
+
+        return outputs
+
+    @torch.no_grad()
+    def inpaiting(
+        self,
+        prompt: Union[str, List[str]],
+        height: int = 512,
+        width: int = 512,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 7.5,
+        negative_prompt: Optional[Union[str, List[str]]] = None,
+        eta: float = 0.0,
+        generator: Optional[torch.Generator] = None,
+        latents: Optional[torch.FloatTensor] = None,
+        output_type: Optional[str] = "pil",
+        callback_steps: Optional[int] = 1,
+        upscale=False,
+        upscale_x: float = 2.0,
+        upscale_method: str = "bicubic",
+        upscale_antialias: bool = False,
+        upscale_denoising_strength: int = 0.7,
+        region_map_state=None,
+        sampler_name="",
+        sampler_opt={},
+        start_time=-1,
+        timeout=180,
+        latent_processing = 0,
+        weight_func = lambda w, sigma, qk: w * sigma * qk.std(),
+        seed = 0,
+        sampler_name_hires= "",
+        sampler_opt_hires= {},
+        latent_upscale_processing = False,
+        ip_adapter_image = None,
+        control_img = None,
+        controlnet_conditioning_scale = None,
+        control_guidance_start = None,
+        control_guidance_end = None,
+        image_t2i_adapter : Optional[PipelineImageInput] = None,
+        adapter_conditioning_scale: Union[float, List[float]] = 1.0,
+        adapter_conditioning_factor: float = 1.0,
+        guidance_rescale: float = 0.0,
+        cross_attention_kwargs = None,
+        clip_skip = None,
+        long_encode = 0,
+        num_images_per_prompt = 1,
+        image: Union[torch.Tensor, PIL.Image.Image] = None,
+        mask_image: Union[torch.Tensor, PIL.Image.Image] = None,
+        masked_image_latents: torch.FloatTensor = None,
+        padding_mask_crop: Optional[int] = None,
+        strength: float = 1.0,
+        ip_adapter_image_embeds: Optional[List[torch.FloatTensor]] = None,
+    ):
+        height, width = self._default_height_width(height, width, None)
+        if isinstance(sampler_name, str):
+            sampler = self.get_scheduler(sampler_name)
+        else:
+            sampler = sampler_name
+        # 1. Check inputs. Raise error if not correct
+        if image_t2i_adapter is not None:
+            height, width = default_height_width(self,height, width, image_t2i_adapter)
+        self.check_inputs(prompt, height, width, callback_steps)
+        # 2. Define call parameters
+        batch_size = 1 if isinstance(prompt, str) else len(prompt)
+        device = self._execution_device
+        # here `guidance_scale` is defined analog to the guidance weight `w` of equation (2)
+        # of the Imagen paper: https://arxiv.org/pdf/2205.11487.pdf . `guidance_scale = 1`
+        # corresponds to doing no classifier free guidance.
+
+        lora_scale = (
+            cross_attention_kwargs.get("scale", None) if cross_attention_kwargs is not None else None
+        )
+        self._do_classifier_free_guidance = False if guidance_scale <= 1.0 else True
+        # 3. Encode input prompt
+
+        text_embeddings, negative_prompt_embeds, text_input_ids = encode_prompt_function(
+            self,
+            prompt,
+            device,
+            num_images_per_prompt,
+            self.do_classifier_free_guidance,
+            negative_prompt,
+            lora_scale = lora_scale,
+            clip_skip = clip_skip,
+            long_encode = long_encode,
+        )
+        if self.do_classifier_free_guidance:
+            text_embeddings = torch.cat([negative_prompt_embeds, text_embeddings])
+
+        text_embeddings = text_embeddings.to(self.unet.dtype)
+
+        # 4. Prepare timesteps
+        init_timestep = min(int(num_inference_steps * strength), num_inference_steps)
+        t_start = max(num_inference_steps - init_timestep, 0)
+        sigmas = self.get_sigmas(num_inference_steps, sampler_opt).to(
+            text_embeddings.device, dtype=text_embeddings.dtype
+        )
+        sigmas = sigmas[t_start:] if strength >= 0 and strength < 1.0 else sigmas
+        is_strength_max = strength == 1.0
+
+
+        # 5. Prepare mask, image, 
+        if padding_mask_crop is not None:
+            crops_coords = self.mask_processor.get_crop_region(mask_image, width, height, pad=padding_mask_crop)
+            resize_mode = "fill"
+        else:
+            crops_coords = None
+            resize_mode = "default"
+
+        original_image = image
+        init_image = self.image_processor.preprocess(
+            image, height=height, width=width, crops_coords=crops_coords, resize_mode=resize_mode
+        )
+        init_image = init_image.to(dtype=torch.float32)
+
+        # 6. Prepare latent variables
+        num_channels_latents = self.vae.config.latent_channels
+        num_channels_unet = self.unet.config.in_channels
+        return_image_latents = num_channels_unet == 4
+
+        image_latents = None
+        noise_inpaiting = None
+
+        latents_outputs = self.prepare_latents_inpating(
+            batch_size * num_images_per_prompt,
+            num_channels_latents,
+            height,
+            width,
+            text_embeddings.dtype,
+            device,
+            generator,
+            latents,
+            image=init_image,
+            sigma=sigmas[0],
+            is_strength_max=is_strength_max,
+            return_noise=True,
+            return_image_latents=return_image_latents,
+        )
+
+        if return_image_latents:
+            latents, noise_inpaiting, image_latents = latents_outputs
+        else:
+            latents, noise_inpaiting = latents_outputs
+
+         # 7. Prepare mask latent variables
+        mask_condition = self.mask_processor.preprocess(
+            mask_image, height=height, width=width, resize_mode=resize_mode, crops_coords=crops_coords
+        )
+
+        if masked_image_latents is None:
+            masked_image = init_image * (mask_condition < 0.5)
+        else:
+            masked_image = masked_image_latents
+
+        mask, masked_image_latents = self.prepare_mask_latents(
+            mask_condition,
+            masked_image,
+            batch_size * num_images_per_prompt,
+            height,
+            width,
+            text_embeddings.dtype,
+            device,
+            generator,
+            self.do_classifier_free_guidance,
+        )
+
+        # 8. Check that sizes of mask, masked image and latents match
+        if num_channels_unet == 9:
+            # default case for runwayml/stable-diffusion-inpainting
+            num_channels_mask = mask.shape[1]
+            num_channels_masked_image = masked_image_latents.shape[1]
+            if num_channels_latents + num_channels_mask + num_channels_masked_image != self.unet.config.in_channels:
+                raise ValueError(
+                    f"Incorrect configuration settings! The config of `pipeline.unet`: {self.unet.config} expects"
+                    f" {self.unet.config.in_channels} but received `num_channels_latents`: {num_channels_latents} +"
+                    f" `num_channels_mask`: {num_channels_mask} + `num_channels_masked_image`: {num_channels_masked_image}"
+                    f" = {num_channels_latents+num_channels_masked_image+num_channels_mask}. Please verify the config of"
+                    " `pipeline.unet` or your `mask_image` or `image` input."
+                )
+        elif num_channels_unet != 4:
+            raise ValueError(
+                f"The unet {self.unet.__class__} should have either 4 or 9 input channels, not {self.unet.config.in_channels}."
+            )
+
+        steps_denoising = len(sigmas)
+        self.k_diffusion_model.sigmas = self.k_diffusion_model.sigmas.to(latents.device)
+        self.k_diffusion_model.log_sigmas = self.k_diffusion_model.log_sigmas.to(
+            latents.device
+        )
+
+        region_state = encode_region_map(
+            self,
+            region_map_state,
+            width = width,
+            height = height,
+            num_images_per_prompt = num_images_per_prompt,
+            text_ids=text_input_ids,
+        )
+        if cross_attention_kwargs is None:
+            cross_attention_kwargs ={}
+        controlnet_conditioning_scale_copy = controlnet_conditioning_scale.copy() if isinstance(controlnet_conditioning_scale, list) else controlnet_conditioning_scale 
+        control_guidance_start_copy =  control_guidance_start.copy() if isinstance(control_guidance_start, list) else control_guidance_start 
+        control_guidance_end_copy =  control_guidance_end.copy() if isinstance(control_guidance_end, list) else control_guidance_end 
+        guess_mode = False
+
+        if self.controlnet is not None:
+            img_control,controlnet_keep,guess_mode,controlnet_conditioning_scale = self.preprocess_controlnet(controlnet_conditioning_scale,control_guidance_start,control_guidance_end,control_img,width,height,num_inference_steps,batch_size,num_images_per_prompt)
+        
+
+        if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
+            image_embeds = self.prepare_ip_adapter_image_embeds(
+                ip_adapter_image,
+                ip_adapter_image_embeds,
+                device,
+                batch_size * num_images_per_prompt,
+                self.do_classifier_free_guidance,
+            )
+        # 6.1 Add image embeds for IP-Adapter
+        added_cond_kwargs = (
+            {"image_embeds": image_embeds}
+            if (ip_adapter_image is not None or ip_adapter_image_embeds is not None)
+            else None
+        )
+        if latent_processing == 1:
+            latents_process = [self.latent_to_image(latents,output_type)]
+        lst_latent_sigma = []
+        step_control = -1
+        adapter_state = None
+        adapter_sp_count = []
+        flag_add_noise_inpaiting = 0
+        if image_t2i_adapter is not None:
+            adapter_state = preprocessing_t2i_adapter(self,image_t2i_adapter,width,height,adapter_conditioning_scale,1)
+        def model_fn(x, sigma):
+            nonlocal step_control,lst_latent_sigma,adapter_sp_count,flag_add_noise_inpaiting
+
+            if start_time > 0 and timeout > 0:
+                assert (time.time() - start_time) < timeout, "inference process timed out"
+
+            if num_channels_unet == 4 and flag_add_noise_inpaiting:
+                init_latents_proper = image_latents
+                if self.do_classifier_free_guidance:
+                    init_mask, _ = mask.chunk(2)
+                else:
+                    init_mask = mask
+
+                if sigma.item() > sigmas[-1].item():
+                    alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma.item())
+                    init_latents_proper = alpha_t * init_latents_proper + sigma_t * noise_inpaiting
+
+                rate_latent_timestep_sigma = (sigma**2 + 1) ** 0.5
+
+                x  = ((1 - init_mask) * init_latents_proper + init_mask * x/ rate_latent_timestep_sigma ) * rate_latent_timestep_sigma
+
+            non_inpainting_latent_model_input = (
+                    torch.cat([x] * 2) if self.do_classifier_free_guidance else x
+                )
+
+            inpainting_latent_model_input = torch.cat(
+                    [non_inpainting_latent_model_input,mask, masked_image_latents], dim=1
+            ) if num_channels_unet == 9 else non_inpainting_latent_model_input
+            region_prompt = {
+                "region_state": region_state,
+                "sigma": sigma[0],
+                "weight_func": weight_func,
+              }
+            cross_attention_kwargs["region_prompt"] = region_prompt
+
+
+            if non_inpainting_latent_model_input.dtype != text_embeddings.dtype:
+                non_inpainting_latent_model_input = non_inpainting_latent_model_input.to(text_embeddings.dtype)
+
+            if inpainting_latent_model_input.dtype != text_embeddings.dtype:
+                inpainting_latent_model_input = inpainting_latent_model_input.to(text_embeddings.dtype)
+            ukwargs = {}
+
+            down_intrablock_additional_residuals = None
+            if adapter_state is not None:
+                if len(adapter_sp_count) < int( steps_denoising* adapter_conditioning_factor):
+                    down_intrablock_additional_residuals = [state.clone() for state in adapter_state]
+                else:
+                    down_intrablock_additional_residuals = None
+            sigma_string_t2i = str(sigma.item())
+            if sigma_string_t2i not in adapter_sp_count:
+                adapter_sp_count.append(sigma_string_t2i)
+
+            if self.controlnet is not None :
+                sigma_string = str(sigma.item())
+                if sigma_string not in lst_latent_sigma:
+                    step_control+=1
+                    lst_latent_sigma.append(sigma_string)
+
+                if isinstance(controlnet_keep[step_control], list):
+                    cond_scale = [c * s for c, s in zip(controlnet_conditioning_scale, controlnet_keep[step_control])]
+                else:
+                    controlnet_cond_scale = controlnet_conditioning_scale
+                    if isinstance(controlnet_cond_scale, list):
+                        controlnet_cond_scale = controlnet_cond_scale[0]
+                    cond_scale = controlnet_cond_scale * controlnet_keep[step_control]
+                
+                down_block_res_samples = None
+                mid_block_res_sample = None
+                down_block_res_samples, mid_block_res_sample = self.controlnet(
+                        non_inpainting_latent_model_input / ((sigma**2 + 1) ** 0.5),
+                        self.k_diffusion_model.sigma_to_t(sigma),
+                        encoder_hidden_states=text_embeddings,
+                        controlnet_cond=img_control,
+                        conditioning_scale=cond_scale,
+                        guess_mode=guess_mode,
+                        return_dict=False,
+                    )
+                if guess_mode and self.do_classifier_free_guidance:
+                    # Infered ControlNet only for the conditional batch.
+                    # To apply the output of ControlNet to both the unconditional and conditional batches,
+                    # add 0 to the unconditional batch to keep it unchanged.
+                    down_block_res_samples = [torch.cat([torch.zeros_like(d), d]) for d in down_block_res_samples]
+                    mid_block_res_sample = torch.cat([torch.zeros_like(mid_block_res_sample), mid_block_res_sample])
+                ukwargs ={
+                "down_block_additional_residuals": down_block_res_samples,
+                "mid_block_additional_residual":mid_block_res_sample,
+                }
+
+            
+            noise_pred = self.k_diffusion_model(
+                inpainting_latent_model_input, sigma, cond=text_embeddings,cross_attention_kwargs=cross_attention_kwargs,down_intrablock_additional_residuals=down_intrablock_additional_residuals,added_cond_kwargs=added_cond_kwargs, **ukwargs
+            )
+
+            
+            if self.do_classifier_free_guidance:
+                noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
+                noise_pred = noise_pred_uncond + guidance_scale * (
+                    noise_pred_text - noise_pred_uncond
+                )
+            if guidance_rescale > 0.0:
+                noise_pred = rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=guidance_rescale)
+             
+
+            if latent_processing == 1:
+                latents_process.append(self.latent_to_image(noise_pred,output_type))
+            flag_add_noise_inpaiting = 1
             return noise_pred
         extra_args = self.get_sampler_extra_args_t2i(
             sigmas, eta, num_inference_steps,sampler_opt,latents,seed, sampler
