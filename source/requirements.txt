@@ -1,6 +1,6 @@
 torch
 einops==0.7.0
-diffusers==0.27.0
+diffusers==0.27.2
 transformers==4.38.2
 k_diffusion==0.1.1.post1
 safetensors==0.4.2
